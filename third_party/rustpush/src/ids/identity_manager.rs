@@ -369,13 +369,28 @@ impl Resource for IdentityResource {
             debug!("Register failed {}!", err);
             drop(users_lock);
 
-            let needs_relog = matches!(err, PushError::AuthInvalid(IDSError(6005)) | PushError::RegisterFailed(IDSError(6005)));
-            return Err(if needs_relog {
-                info!("Auth returns 6005, relog required!");
-                PushError::DoNotRetry(Box::new(err))
-            } else {
-                err
-            })
+            // 6005 from Apple on a rereg is a server-side state issue that
+            // is often transient (Apple's auth state typically clears within
+            // seconds-to-minutes). Marking it as a permanent failure via
+            // `DoNotRetry` leaves the cert stuck in a `Failed(retry_wait:
+            // None)` state — `ResourceManager::refresh()` bails immediately
+            // on that state (`util.rs:1100`), so no future `refresh()` call
+            // will retry the rereg. The only path out is a full re-login
+            // (`try_auth` + `do_login`).
+            //
+            // Returning the original error (a retriable `AuthInvalid(6005)`
+            // or `RegisterFailed(6005)`) instead makes the rereg failure
+            // retriable: `ResourceManager` will mark it as
+            // `Failed(retry_wait: Some(duration))`, the schedule_rereg
+            // background task will retry in 1-4 hours, and bubbles'
+            // `send_text` can trigger an immediate retry via
+            // `identity.refresh()` when a 6005 is observed on a send. This
+            // lets the cert self-heal in the running process without
+            // requiring the user to sign out and back in.
+            if matches!(err, PushError::AuthInvalid(IDSError(6005)) | PushError::RegisterFailed(IDSError(6005))) {
+                info!("Auth returned 6005 on rereg; marking as retriable (will auto-recover when Apple state clears)");
+            }
+            return Err(err)
         }
         debug!("Register success!");
         // drop, not downgrade, to process any readers holding cache lock right now

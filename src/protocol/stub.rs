@@ -261,6 +261,7 @@ impl Backend for StubBackend {
         &self,
         _store: &crate::store::Store,
         _cutoff_ms: i64,
+        _force: bool,
     ) -> crate::sync::SyncResult {
         crate::sync::SyncResult::default()
     }

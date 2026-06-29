@@ -393,11 +393,17 @@ pub trait Backend: Send + Sync {
     /// no cutoff, since the continuation token tracks progress). Returns a
     /// `SyncResult` with stats; logs the result. The continuation token is
     /// in-memory only for now (a follow-up will persist it across launches).
+    ///
+    /// When `force` is true, the `cloud_sync_enabled` config gate and the
+    /// post-failure backoff are bypassed. This is used by the manual "Sync
+    /// Now" button so the user can pull missed messages on demand even when
+    /// automatic cloud sync is disabled.
     #[cfg(feature = "rustpush")]
     async fn sync_missed_messages(
         &self,
         store: &Store,
         cutoff_ms: i64,
+        force: bool,
     ) -> crate::sync::SyncResult;
 }
 

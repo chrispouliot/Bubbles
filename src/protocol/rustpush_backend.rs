@@ -30,10 +30,11 @@ use tokio::sync::{broadcast, Mutex};
 use rustpush::{
     APSConnection, APSMessage, AppleAccount, ArcAnisetteClient, Attachment,
     CircleClientSession, ConversationData, DebugMutex, DebugRwLock, DefaultAnisetteProvider,
-    EditMessage, IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener, IndexedMessagePart,
-    LPLinkMetadata, LinkMeta, LoginState as RpLoginState, MMCSFile, Message, MessageInst,
-    MessagePart, MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, Reaction,
-    ReactMessageType, TokenProvider, VerifyBody as RpVerifyBody,
+    EditMessage, IDSError, IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener,
+    IndexedMessagePart, LPLinkMetadata, LinkMeta, LoginState as RpLoginState, MMCSFile,
+    Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, OSConfig,
+    PushError, ReactMessage, Reaction, ReactMessageType, TokenProvider,
+    VerifyBody as RpVerifyBody,
 };
 
 use crate::store::{
@@ -108,7 +109,12 @@ impl RustpushBackend {
     /// This is the auth path that lets the sync run on every launch (not
     /// just the first). It's called from `sync_missed_messages` when the
     /// session state is incomplete.
-    async fn reconstruct_account(&self) -> Result<(), ()> {
+    ///
+    /// When `force` is true, the `cloud_sync_enabled` config gate and the
+    /// post-failure backoff are bypassed. This is used by the manual "Sync
+    /// Now" button so the user can pull missed messages on demand even when
+    /// automatic cloud sync is disabled or the last sync hit the backoff.
+    async fn reconstruct_account(&self, force: bool) -> Result<(), ()> {
         let conn_arc = self.conn.lock().unwrap().clone();
         let conn = match conn_arc {
             Some(c) => c,
@@ -133,33 +139,38 @@ impl RustpushBackend {
             return Err(());
         }
 
-        // Check cloud sync enabled config.
-        let bubbles_config = crate::sync::read_config(
-            &state_dir.join(crate::sync::CONFIG_FILENAME),
-        );
-        if !bubbles_config.cloud_sync_enabled {
-            log::info!("reconstruct_account: cloud sync disabled in config, skipping");
-            return Err(());
-        }
-
-        // Check sync backoff.
-        let last_error_secs = crate::sync::read_last_sync_error(
-            &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
-        );
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if !crate::sync::should_sync_now(
-            last_error_secs,
-            now_secs,
-            crate::sync::DEFAULT_BACKOFF_SECS,
-        ) {
-            log::info!(
-                "reconstruct_account: in sync backoff (last error at {:?}), skipping",
-                last_error_secs,
+        // Check cloud sync enabled config (skipped when `force` is true so the
+        // manual "Sync Now" button works regardless of the user's preference).
+        if !force {
+            let bubbles_config = crate::sync::read_config(
+                &state_dir.join(crate::sync::CONFIG_FILENAME),
             );
-            return Err(());
+            if !bubbles_config.cloud_sync_enabled {
+                log::info!("reconstruct_account: cloud sync disabled in config, skipping");
+                return Err(());
+            }
+
+            // Check sync backoff (also skipped when forced).
+            let last_error_secs = crate::sync::read_last_sync_error(
+                &state_dir.join(crate::sync::LAST_SYNC_ERROR_FILENAME),
+            );
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if !crate::sync::should_sync_now(
+                last_error_secs,
+                now_secs,
+                crate::sync::DEFAULT_BACKOFF_SECS,
+            ) {
+                log::info!(
+                    "reconstruct_account: in sync backoff (last error at {:?}), skipping",
+                    last_error_secs,
+                );
+                return Err(());
+            }
+        } else {
+            log::info!("reconstruct_account: forced (manual sync) — skipping cloud_sync_enabled and backoff checks");
         }
 
         // Recreate the anisette from the stored connection.
@@ -207,8 +218,14 @@ impl RustpushBackend {
                 // Only do do_login if we don't have a fresh cached MME.
                 // When the cache is fresh, we inject the saved MME into the
                 // TokenProvider in sync_missed_messages, avoiding the network
-                // call to login_apple_delegates.
-                if !cached_mme_valid {
+                // call to login_apple_delegates. When `force` is true (manual
+                // "Sync Now"), bypass the MME-freshness check too: a fresh MME
+                // doesn't guarantee a valid IDS cert (Apple can rotate the cert
+                // server-side while the iCloud MME is still good), and the only
+                // path that regenerates the cert is `do_login`. Skipping it on
+                // a forced sync would leave a broken-cert account in a stuck
+                // state until the 7-day MME window expired.
+                if !cached_mme_valid || force {
                     if let Err(e) = api::do_login(
                         self.state_path.clone(),
                         &account,
@@ -220,6 +237,9 @@ impl RustpushBackend {
                         // sync_missed_messages will report the failure clearly. Storing
                         // the account lets a future attempt (e.g., on the next launch or
                         // wake) try do_login again without re-doing try_auth.
+                    }
+                    if force && cached_mme_valid {
+                        log::info!("reconstruct_account: forced do_login despite fresh MME (cert regen requested)");
                     }
                 } else {
                     log::info!("reconstruct_account: skipped do_login (using cached MME)");
@@ -933,14 +953,55 @@ impl Backend for RustpushBackend {
         inst.id = guid.clone();
         let date = now_ms();
         let inst = Mutex::new(inst);
-        crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
+
+        // Try the send. If the underlying error is a 6005 cert/identity
+        // rejection from Apple (the typical "stale IDS cert" symptom — the
+        // auto-rereg already fired once and failed), attempt a self-heal
+        // before giving up. The self-heal forces a fresh re-register on the
+        // IMClient's IdentityManager; if Apple's auth state has cleared
+        // since the last rereg, this succeeds and the cert is updated in
+        // place so the retry uses the new cert. We also clear the cached
+        // MME so the next `reconstruct_account` will run a fresh `do_login`
+        // (defense in depth — the rereg is the primary recovery here, but
+        // the MME clear ensures the next launch is also healthy).
+        let result = crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
             let mut guard = inst.lock().await;
-            imclient
-                .send(&mut guard)
-                .await
-                .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))
+            imclient.send(&mut guard).await
         })
-        .await?;
+        .await;
+
+        let send_result = match result {
+            Ok(job) => Ok(job),
+            Err(e) if is_6005_error(&e) => {
+                log::warn!(
+                    "send failed with IDS 6005; attempting cert self-heal (this can take a few seconds)"
+                );
+                // Clear the MME cache so the next reconstruct_account does
+                // do_login (defense in depth). The rereg below is the
+                // primary recovery; this ensures the next launch is healthy
+                // even if the rereg still fails.
+                *self.cached_mme.lock().unwrap() = None;
+
+                match imclient.identity.refresh().await {
+                    Ok(()) => {
+                        log::info!("cert self-heal: re-register succeeded, retrying send");
+                        let mut guard = inst.lock().await;
+                        imclient.send(&mut guard).await
+                    }
+                    Err(rereg_err) => {
+                        log::warn!(
+                            "cert self-heal: re-register still failing ({rereg_err:?}); \
+                             the schedule_rereg background task will retry every 1-4 hours"
+                        );
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        send_result?;
+
         Ok(IncomingMessage {
             guid,
             chat: chat.clone(),
@@ -1117,13 +1178,14 @@ impl Backend for RustpushBackend {
         &self,
         store: &crate::store::Store,
         cutoff_ms: i64,
+        force: bool,
     ) -> crate::sync::SyncResult {
-        // Best-effort: if the session state is incomplete (e.g. after a
+        // Best-effort: if the session state is incomplete (e.g., after a
         // restart), try to reconstruct the AppleAccount from gsa.plist.
         // On failure (the common case until the follow-up stores the APS
         // connection), the method falls through to the default-return path.
         if self.account.lock().unwrap().is_none() {
-            let _ = self.reconstruct_account().await;
+            let _ = self.reconstruct_account(force).await;
         }
 
         // Need all three session handles; if any is missing, the session isn't
@@ -1669,6 +1731,24 @@ fn is_from_me(inst: &MessageInst, handles: &[String]) -> bool {
 
 fn is_incoming_content(inst: &MessageInst, handles: &[String]) -> bool {
     matches!(inst.message, Message::Message(_)) && !is_from_me(inst, handles)
+}
+
+/// Walk a `PushError` chain and return `true` if any layer contains an
+/// `IDSError(6005)` — Apple's "Bad authentication, re-enter device details
+/// if persistent" rejection.
+///
+/// This is used by `send_text` to detect a stale IDS cert (the typical
+/// symptom: every send returns 6005 and the auto-rereg has already fired
+/// and failed once) and trigger an in-process self-heal via a fresh rereg.
+fn is_6005_error(err: &PushError) -> bool {
+    match err {
+        PushError::LookupFailed(IDSError(6005))
+        | PushError::AuthInvalid(IDSError(6005))
+        | PushError::RegisterFailed(IDSError(6005)) => true,
+        // Errors are sometimes wrapped one or more layers deep; recurse.
+        PushError::DoNotRetry(inner) => is_6005_error(inner),
+        _ => false,
+    }
 }
 
 /// Build a wire-level `ReactMessage` from the caller's parameters.

@@ -27,6 +27,7 @@ use crate::store::{
 use crate::store::Tapback;
 #[cfg(feature = "rustpush")]
 use rustpush::{Reaction, ReactMessageType};
+use tokio::sync::oneshot;
 
 mod avatar;
 
@@ -991,7 +992,7 @@ pub fn enter_messaging(
                     .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
                     .max(now_unix_ms - 48 * 60 * 60 * 1000);
                 let sync_result = backend
-                    .sync_missed_messages(&store, cutoff_ms)
+                    .sync_missed_messages(&store, cutoff_ms, false)
                     .await;
                 log::info!("initial sync: {sync_result:?}");
             } else {
@@ -1023,7 +1024,7 @@ pub fn enter_messaging(
                         .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
                         .max(now_unix_ms - 48 * 60 * 60 * 1000);
                     let sync_result = backend
-                        .sync_missed_messages(&store, cutoff_ms)
+                        .sync_missed_messages(&store, cutoff_ms, false)
                         .await;
                     log::info!("wake sync: {sync_result:?}");
                 } else {
@@ -1735,8 +1736,27 @@ impl Ui {
                     let store = store.clone();
                     let status_label = status_label.clone();
                     let button = button.clone();
+                    // Run the sync on the Tokio runtime (it touches hyper, which
+                    // requires a reactor — `glib::spawn_future_local` doesn't
+                    // provide one and would panic). Bridge the result back to
+                    // the glib main thread for the UI update.
+                    let (tx, rx) = oneshot::channel();
+                    crate::runtime::runtime().spawn(async move {
+                        let result = backend
+                            .sync_missed_messages(&store, i64::MIN, true)
+                            .await;
+                        let _ = tx.send(result);
+                    });
                     glib::spawn_future_local(async move {
-                        let result = backend.sync_missed_messages(&store, i64::MIN).await;
+                        let result = match rx.await {
+                            Ok(r) => r,
+                            Err(_) => {
+                                log::error!("manual sync: tokio task cancelled");
+                                status_label.set_text("Sync failed");
+                                button.set_sensitive(true);
+                                return;
+                            }
+                        };
                         let summary = match result.messages_processed {
                             0 => "No new messages".to_string(),
                             1 => "Synced 1 message".to_string(),
