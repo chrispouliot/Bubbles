@@ -7,7 +7,7 @@
 //! backend pulses the notifier.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
@@ -1616,9 +1616,11 @@ impl Ui {
                     return;
                 }
                 crate::text_scale::set(new_val);
-                // Refresh the bubble's font size in place. The CSS class
-                // is stable; we just rewrite the rule.
+                // Refresh the preview bubble's font size in place.
                 refresh_preview_css();
+                // Refresh every open-chat message widget in place — no
+                // widget rebuild, no chat re-select needed.
+                refresh_chat_text_css();
                 dec_btn.set_sensitive(new_val > min);
                 inc_btn.set_sensitive(new_val < max);
                 // Apply the new size to the open chat (if any) so messages
@@ -4424,27 +4426,85 @@ enum ScrollTo {
     Widget(gtk::Widget),
 }
 
-/// Apply the current text size offset to a widget's font via a per-widget CSS
-/// provider. The offset is in points and added to the base size. No-op at
-/// offset 0 (avoids any overhead).
-fn apply_text_scale(w: &impl IsA<gtk::Widget>, base_pt: f64) {
+/// A shared per-base-size CSS provider entry. Each base size (e.g. 10pt, 13pt)
+/// gets exactly one provider and one stable class name so that
+/// `refresh_chat_text_css` can rewrite the rule in place for all widgets at
+/// once.
+struct ChatTextProviderEntry {
+    base_pt: f64,
+    provider: gtk::CssProvider,
+}
+
+// Map from base-size key (base_pt × 100 rounded) to the shared provider.
+// Lives in a `thread_local!` because `gtk::CssProvider` isn't `Send + Sync`.
+thread_local! {
+    static CHAT_TEXT_PROVIDERS: RefCell<HashMap<u64, ChatTextProviderEntry>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Convert a base point size to a stable integer key for the provider map.
+fn base_key(base_pt: f64) -> u64 {
+    (base_pt * 100.0).round() as u64
+}
+
+/// Build the CSS rule string for a given base point size using the current
+/// `text_scale::get()` offset. Pure: no GTK, no I/O, no side effects. Used by
+/// `apply_text_scale` and `refresh_chat_text_css` to keep the format in one
+/// place.
+pub(crate) fn chat_text_css(base_pt: f64) -> String {
     let offset = crate::text_scale::get();
+    let key = base_key(base_pt);
+    let class = format!("text-scale-{}", key);
+    format!(".{} {{ font-size: {:.2}pt; }}", class, base_pt + offset)
+}
+
+/// Apply the current text size offset to a widget's font via a **shared**
+/// per-base-size CSS provider. The offset is in points and added to the base
+/// size. All widgets with the same base size share one provider and one CSS
+/// class, so a single `refresh_chat_text_css()` call updates every widget on
+/// the next paint without a rebuild.
+fn apply_text_scale(w: &impl IsA<gtk::Widget>, base_pt: f64) {
     use gtk::prelude::*;
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let class = format!("text-scale-{id}");
-    let css = format!(".{} {{ font-size: {:.2}pt; }}", class, base_pt + offset);
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(&css);
-    // style_context() is deprecated since 4.10; add the provider at the
-    // display level instead. The CSS is scoped by a unique per-widget class
-    // name, so display-level application only ever styles this one widget.
-    gtk::style_context_add_provider_for_display(
-        &w.display(),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    let key = base_key(base_pt);
+    let class = format!("text-scale-{}", key);
+
+    CHAT_TEXT_PROVIDERS.with(|p| {
+        let mut map = p.borrow_mut();
+        map.entry(key).or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            let css = chat_text_css(base_pt);
+            provider.load_from_string(&css);
+            gtk::style_context_add_provider_for_display(
+                &w.display(),
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            ChatTextProviderEntry {
+                base_pt,
+                provider,
+            }
+        });
+    });
+
     w.add_css_class(&class);
+}
+
+/// Rewrite the CSS rule on every registered per-base-size chat-text provider
+/// using the current `text_scale::get()` offset.  All widgets sharing those
+/// providers pick up the new size on the next paint — no rebuild needed.
+fn refresh_chat_text_css() {
+    // Collect cloned entries so we don't hold the RefCell borrow across
+    // `load_from_string` (which may acquire an internal lock on the provider).
+    let entries: Vec<(f64, gtk::CssProvider)> = CHAT_TEXT_PROVIDERS.with(|p| {
+        p.borrow()
+            .values()
+            .map(|e| (e.base_pt, e.provider.clone()))
+            .collect()
+    });
+    for (base_pt, provider) in entries {
+        let css = chat_text_css(base_pt);
+        provider.load_from_string(&css);
+    }
 }
 
 /// CSS class assigned to the live chat-text-size preview bubble in the
@@ -6565,6 +6625,65 @@ mod tests {
         };
         let result = super::chat_avatar_custom_path(&c);
         assert_eq!(result, Some(input.as_str()));
+    }
+
+    // --- chat_text_css tests ---
+    //
+    // These tests pin the pure string-generation behaviour: `chat_text_css(base_pt)`
+    // returns a CSS rule whose `font-size` is `base_pt + text_scale::get()`.
+    // The function is pure (no GTK, no I/O, no side effects) — the format is:
+    //   `format!($".<class> {{ font-size: {:.2}pt; }}", base_pt + offset)`
+    //
+    // Expected red (compile error): `super::chat_text_css` does not exist yet.
+    // The worker must add `pub(crate) fn chat_text_css(base_pt: f64) -> String`
+    // in this module.
+
+    #[test]
+    fn chat_text_css_single_base_reflects_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::text_scale::set_data_dir_for_tests(tmp.path().to_path_buf());
+
+        // Reset to default offset.
+        crate::text_scale::set(0.0);
+
+        let css = super::chat_text_css(13.0);
+        assert!(
+            css.contains("font-size: 13.00pt"),
+            "at offset 0.0, expected 13.00pt, got: {css}"
+        );
+
+        // Change the offset — the function must reflect the new size.
+        crate::text_scale::set(2.0);
+        let css = super::chat_text_css(13.0);
+        assert!(
+            css.contains("font-size: 15.00pt"),
+            "after offset +2.0, expected 15.00pt, got: {css}"
+        );
+    }
+
+    #[test]
+    fn chat_text_css_multiple_bases_all_reflect_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::text_scale::set_data_dir_for_tests(tmp.path().to_path_buf());
+
+        // Reset to default offset.
+        crate::text_scale::set(0.0);
+
+        let css10 = super::chat_text_css(10.0);
+        let css12 = super::chat_text_css(12.0);
+        let css13 = super::chat_text_css(13.0);
+        assert!(css10.contains("font-size: 10.00pt"), "base 10 at offset 0");
+        assert!(css12.contains("font-size: 12.00pt"), "base 12 at offset 0");
+        assert!(css13.contains("font-size: 13.00pt"), "base 13 at offset 0");
+
+        // Change offset — all bases reflect the change.
+        crate::text_scale::set(1.5);
+        let css10 = super::chat_text_css(10.0);
+        let css12 = super::chat_text_css(12.0);
+        let css13 = super::chat_text_css(13.0);
+        assert!(css10.contains("font-size: 11.50pt"), "base 10 after +1.5");
+        assert!(css12.contains("font-size: 13.50pt"), "base 12 after +1.5");
+        assert!(css13.contains("font-size: 14.50pt"), "base 13 after +1.5");
     }
 }
 

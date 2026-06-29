@@ -14,7 +14,28 @@ pub const MIN_OFFSET: f64 = -5.0;
 /// by the +/- stepper to clamp and to disable the "+" button at the ceiling.
 pub const MAX_OFFSET: f64 = 5.0;
 
+// Per-thread override so parallel tests don't race on the state file.
+#[cfg(test)]
+thread_local! {
+    static TEST_DATA_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Redirect the data directory for the current test thread. Only available
+/// in test builds. Each test should call this before the first `get()`/`set()`
+/// to isolate its state file from other threads.
+#[cfg(test)]
+pub(crate) fn set_data_dir_for_tests(path: PathBuf) {
+    TEST_DATA_DIR.with(|d| *d.borrow_mut() = Some(path));
+}
+
 fn data_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(path) = TEST_DATA_DIR.with(|d| d.borrow().clone()) {
+            return path;
+        }
+    }
     glib::user_data_dir().join("bubbles")
 }
 
