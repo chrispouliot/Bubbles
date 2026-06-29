@@ -881,24 +881,44 @@ impl Backend for RustpushBackend {
                 log::warn!(
                     "send failed with IDS 6005; attempting cert self-heal (this can take a few seconds)"
                 );
-                // Force a re-register on the IMClient's IdentityManager.
-                // If Apple's state has cleared since the last rereg, this
-                // succeeds and the cert is updated in place; if not, the
-                // error is returned to the caller. The next launch's
-                // reconstruct_account (which now always runs `do_login`)
-                // will re-attempt the cert refresh.
+                // First, force a re-register on the IMClient's
+                // IdentityManager. If Apple's state has cleared since the
+                // last rereg, this succeeds and the cert is updated in
+                // place. If it times out or fails for any other reason
+                // (e.g. rereg endpoint hung — the typical case after a
+                // suspend), fall back to a full `do_login` via
+                // `reconstruct_account(force: true)`. That's the same path
+                // a fresh launch takes, so it always succeeds when the
+                // Apple account state on disk is intact — and the user
+                // reported that "quit and relaunch it works again," which
+                // is exactly this path.
+                let retry_send = || async {
+                    let mut guard = inst.lock().await;
+                    imclient.send(&mut guard).await
+                };
                 match imclient.identity.refresh().await {
                     Ok(()) => {
                         log::info!("cert self-heal: re-register succeeded, retrying send");
-                        let mut guard = inst.lock().await;
-                        imclient.send(&mut guard).await
+                        retry_send().await
                     }
                     Err(rereg_err) => {
                         log::warn!(
-                            "cert self-heal: re-register still failing ({rereg_err:?}); \
-                             the schedule_rereg background task will retry every 1-4 hours"
+                            "cert self-heal: re-register failed ({rereg_err:?}), \
+                             trying do_login fallback (this may take a few seconds)"
                         );
-                        Err(e)
+                        match self.reconstruct_account(true).await {
+                            Ok(()) => {
+                                log::info!("cert self-heal: do_login fallback succeeded, retrying send");
+                                retry_send().await
+                            }
+                            Err(()) => {
+                                log::error!(
+                                    "cert self-heal: do_login fallback also failed; \
+                                     original rereg error: {rereg_err:?}"
+                                );
+                                Err(e)
+                            }
+                        }
                     }
                 }
             }

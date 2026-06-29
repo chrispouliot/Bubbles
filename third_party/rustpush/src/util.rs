@@ -897,7 +897,7 @@ pub trait Resource: Send + Sync + Sized {
 }
 
 const MAX_RESOURCE_REGEN: Duration = Duration::from_secs(15);
-const MAX_RESOURCE_WAIT: Duration = Duration::from_secs(30);
+    const MAX_RESOURCE_WAIT: Duration = Duration::from_secs(300);
 
 pub struct ResourceManager<T: Resource> {
     name: &'static str,
