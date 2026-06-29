@@ -81,10 +81,6 @@ pub struct RustpushBackend {
     /// `try_auth` with `creds: None`.
     /// Populated by `setup_push` (or `restore_session`).
     conn: StdMutex<Option<Arc<BufferedApsConn>>>,
-    /// Cached MME data loaded from disk in `reconstruct_account`.
-    /// Used by `sync_missed_messages` to inject into the TokenProvider,
-    /// avoiding a full `do_login` when the cache is fresh.
-    cached_mme: StdMutex<Option<Arc<crate::sync::CachedMme>>>,
 }
 
 impl RustpushBackend {
@@ -96,7 +92,6 @@ impl RustpushBackend {
             anisette: StdMutex::new(None),
             config: StdMutex::new(None),
             conn: StdMutex::new(None),
-            cached_mme: StdMutex::new(None),
         }
     }
 
@@ -106,9 +101,14 @@ impl RustpushBackend {
     /// (missing gsa.plist, decryption error, network auth failure), logs
     /// a warning and returns `Err(())` without updating `self.account`.
     ///
-    /// This is the auth path that lets the sync run on every launch (not
-    /// just the first). It's called from `sync_missed_messages` when the
-    /// session state is incomplete.
+    /// This is the auth path that lets the sync run on every launch. It
+    /// also regenerates the IDS cert (via the `do_login` step) so that
+    /// Apple's server-side state is fresh on every launch — this is what
+    /// keeps the iMessage cert from going stale every few hours. The
+    /// previous "MME cache" optimization that skipped `do_login` when the
+    /// MME was fresh was removed because it caused the cert to stay bad
+    /// when the rereg failed (Apple's auth state rotates faster than the
+    /// 7-day MME window).
     ///
     /// When `force` is true, the `cloud_sync_enabled` config gate and the
     /// post-failure backoff are bypassed. This is used by the manual "Sync
@@ -180,30 +180,6 @@ impl RustpushBackend {
         // to recreate and may be reusable.
         *self.anisette.lock().unwrap() = Some(anisette.clone());
 
-        // Try loading the cached MME from disk. If present and fresh,
-        // store it on self.cached_mme so sync_missed_messages can inject
-        // it into the TokenProvider, avoiding a full do_login.
-        let cached_mme_valid = if let Some(cached_mme) = crate::sync::load_cached_mme(&state_dir) {
-            if !crate::sync::mme_token_is_expired(&cached_mme, std::time::SystemTime::now()) {
-                log::info!(
-                    "reconstruct_account: cached MME token present and fresh (age: {:?}), will skip do_login",
-                    std::time::SystemTime::now()
-                        .duration_since(cached_mme.refreshed)
-                        .ok()
-                );
-                *self.cached_mme.lock().unwrap() = Some(Arc::new(cached_mme));
-                true
-            } else {
-                log::debug!("reconstruct_account: cached MME token expired, will do do_login");
-                *self.cached_mme.lock().unwrap() = None;
-                false
-            }
-        } else {
-            log::debug!("reconstruct_account: no cached MME token, will do do_login");
-            *self.cached_mme.lock().unwrap() = None;
-            false
-        };
-
         // Call try_auth with creds: None — reads gsa.plist and decrypts the
         // password via GSAConfig::get_password() (uses the AES keystore
         // initialized at boot in do_first_time_init, no idms needed).
@@ -215,93 +191,23 @@ impl RustpushBackend {
             None,  // <- key: None means "reconstruct from gsa.plist"
         ).await {
             Ok((account, _login_state)) => {
-                // Only do do_login if we don't have a fresh cached MME.
-                // When the cache is fresh, we inject the saved MME into the
-                // TokenProvider in sync_missed_messages, avoiding the network
-                // call to login_apple_delegates. When `force` is true (manual
-                // "Sync Now"), bypass the MME-freshness check too: a fresh MME
-                // doesn't guarantee a valid IDS cert (Apple can rotate the cert
-                // server-side while the iCloud MME is still good), and the only
-                // path that regenerates the cert is `do_login`. Skipping it on
-                // a forced sync would leave a broken-cert account in a stuck
-                // state until the 7-day MME window expired.
-                if !cached_mme_valid || force {
-                    if let Err(e) = api::do_login(
-                        self.state_path.clone(),
-                        &account,
-                        None,
-                        &config,
-                    ).await {
-                        log::warn!("reconstruct_account: do_login failed: {e:?}");
-                        // Continue anyway — the account is still partially usable, and
-                        // sync_missed_messages will report the failure clearly. Storing
-                        // the account lets a future attempt (e.g., on the next launch or
-                        // wake) try do_login again without re-doing try_auth.
-                    }
-                    if force && cached_mme_valid {
-                        log::info!("reconstruct_account: forced do_login despite fresh MME (cert regen requested)");
-                    }
-                } else {
-                    log::info!("reconstruct_account: skipped do_login (using cached MME)");
-                }
-
-                // Save the MME delegate to disk for future launches.
-                // If the cache was valid, we already have the delegate bytes
-                // in self.cached_mme — no need to create a TokenProvider and
-                // call get_mme_token. Otherwise we create a fresh TokenProvider,
-                // call get_mme_token, and serialize the result.
-                if cached_mme_valid {
-                    // Re-save the cached bytes with a fresh timestamp.
-                    if let Some(cached) = self.cached_mme.lock().unwrap().clone() {
-                        let mme = crate::sync::CachedMme {
-                            delegate_bytes: cached.delegate_bytes.clone(),
-                            refreshed: std::time::SystemTime::now(),
-                        };
-                        if let Err(e) = crate::sync::save_cached_mme(&state_dir, &mme) {
-                            log::warn!("reconstruct_account: save_cached_mme failed: {e}");
-                        } else {
-                            log::info!("reconstruct_account: MME token saved to disk");
-                        }
-                    }
-                } else {
-                    let config_arc: Arc<dyn OSConfig> = match &config {
-                        api::JoinedOSConfig::MacOS(conf) => conf.clone(),
-                        api::JoinedOSConfig::Relay(conf) => conf.clone(),
-                    };
-                    let token_provider = TokenProvider::new(account.clone(), config_arc);
-                    let mme_extracted = match token_provider.get_mme_token("mmeAuthToken").await {
-                        Ok(_token) => token_provider.mme_state().await,
-                        Err(e) => {
-                            log::warn!(
-                                "reconstruct_account: get_mme_token failed: {e:?}"
-                            );
-                            None
-                        }
-                    };
-                    if let Some((delegate, _refreshed)) = mme_extracted {
-                        let bytes = {
-                            let mut buf = Vec::new();
-                            if let Err(e) = plist::to_writer_xml(&mut buf, &delegate) {
-                                log::warn!(
-                                    "reconstruct_account: serialize MME delegate failed: {e}"
-                                );
-                                Vec::new()
-                            } else {
-                                buf
-                            }
-                        };
-                        let mme = crate::sync::CachedMme {
-                            delegate_bytes: bytes,
-                            refreshed: std::time::SystemTime::now(),
-                        };
-                        if let Err(e) = crate::sync::save_cached_mme(&state_dir, &mme) {
-                            log::warn!("reconstruct_account: save_cached_mme failed: {e}");
-                        } else {
-                            log::info!("reconstruct_account: MME token saved to disk");
-                        }
-                    } else {
-                        log::debug!("reconstruct_account: MME delegate not available after get_mme_token");
-                    }
+                // Always run do_login. The previous "skip if MME is fresh"
+                // optimization caused the IDS cert to stay bad whenever the
+                // rereg failed (Apple's auth state rotates faster than the
+                // 7-day MME window). Running do_login on every launch keeps
+                // the Apple account state fresh so rustpush's auto-rereg
+                // succeeds in the background.
+                if let Err(e) = api::do_login(
+                    self.state_path.clone(),
+                    &account,
+                    None,
+                    &config,
+                ).await {
+                    log::warn!("reconstruct_account: do_login failed: {e:?}");
+                    // Continue anyway — the account is still partially usable, and
+                    // sync_missed_messages will report the failure clearly. Storing
+                    // the account lets a future attempt (e.g., on the next launch or
+                    // wake) try do_login again without re-doing try_auth.
                 }
 
                 log::info!("reconstruct_account: successfully reconstructed AppleAccount");
@@ -960,10 +866,9 @@ impl Backend for RustpushBackend {
         // before giving up. The self-heal forces a fresh re-register on the
         // IMClient's IdentityManager; if Apple's auth state has cleared
         // since the last rereg, this succeeds and the cert is updated in
-        // place so the retry uses the new cert. We also clear the cached
-        // MME so the next `reconstruct_account` will run a fresh `do_login`
-        // (defense in depth — the rereg is the primary recovery here, but
-        // the MME clear ensures the next launch is also healthy).
+        // place so the retry uses the new cert. The next launch's
+        // `reconstruct_account` (which always runs `do_login`) provides
+        // a second chance to refresh the cert.
         let result = crate::retry::retry(3, std::time::Duration::from_millis(500), || async {
             let mut guard = inst.lock().await;
             imclient.send(&mut guard).await
@@ -976,12 +881,12 @@ impl Backend for RustpushBackend {
                 log::warn!(
                     "send failed with IDS 6005; attempting cert self-heal (this can take a few seconds)"
                 );
-                // Clear the MME cache so the next reconstruct_account does
-                // do_login (defense in depth). The rereg below is the
-                // primary recovery; this ensures the next launch is healthy
-                // even if the rereg still fails.
-                *self.cached_mme.lock().unwrap() = None;
-
+                // Force a re-register on the IMClient's IdentityManager.
+                // If Apple's state has cleared since the last rereg, this
+                // succeeds and the cert is updated in place; if not, the
+                // error is returned to the caller. The next launch's
+                // reconstruct_account (which now always runs `do_login`)
+                // will re-attempt the cert refresh.
                 match imclient.identity.refresh().await {
                     Ok(()) => {
                         log::info!("cert self-heal: re-register succeeded, retrying send");
@@ -1233,25 +1138,11 @@ impl Backend for RustpushBackend {
         // Build the TokenProvider from the in-memory AppleAccount.
         // This is the same `TokenProvider` used by the CloudKit and Keychain
         // clients to authenticate with Apple's token service.
+        // (Previously this block injected a cached MME delegate here to
+        // skip the Apple auth round-trip on launch. That optimization was
+        // removed along with the rest of the MME cache because it caused
+        // the IDS cert to stay bad whenever the rereg failed.)
         let token_provider = TokenProvider::new(account.clone(), config_arc.clone());
-
-        // Inject the cached MME if present (set in reconstruct_account).
-        // This avoids the need for a fresh do_login / get_mme_token call when
-        // the cached token is still within the 7-day expiry window.
-        // The MobileMeDelegateResponse type is not re-exported from rustpush,
-        // so we deserialize via type inference from set_mme_state's signature.
-        let cached_mme_opt = self.cached_mme.lock().unwrap().clone();
-        // Mutex guard dropped here; safe to await below.
-        if let Some(cached_mme) = cached_mme_opt {
-            if let Ok(delegate) = plist::from_bytes(&cached_mme.delegate_bytes) {
-                token_provider
-                    .set_mme_state(delegate, cached_mme.refreshed)
-                    .await;
-                log::debug!("sync_missed_messages: injected cached MME into TokenProvider");
-            } else {
-                log::warn!("sync_missed_messages: failed to deserialize cached MME");
-            }
-        }
 
         // Build the CloudKitClient.
         let ck_client: Arc<rustpush::cloudkit::CloudKitClient<_>> = Arc::new(
@@ -1958,7 +1849,74 @@ fn is_6005_error(err: &PushError) -> bool {
         | PushError::RegisterFailed(IDSError(6005)) => true,
         // Errors are sometimes wrapped one or more layers deep; recurse.
         PushError::DoNotRetry(inner) => is_6005_error(inner),
+        // `ResourceFailure(ResourceFailure { retry_wait, error })` is the
+        // form produced when a `ResourceManager::refresh()` call observes
+        // a failed rereg. The inner `error` is the original failure
+        // (typically `AuthInvalid(IDSError(6005))` for the case we care
+        // about), so we recurse into it.
+        PushError::ResourceFailure(rf) => is_6005_error(&rf.error),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod is_6005_error_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Regression: a `ResourceFailure` wrapping `AuthInvalid(IDSError(6005))`
+    /// must be detected as a 6005 error. This is the form produced by
+    /// `ResourceManager::refresh()` when an auto-rereg fails with 6005.
+    /// Without unwrapping `ResourceFailure`, the self-heal in `send_text`
+    /// never fires (the user sees a silent "send failed" with no recovery
+    /// attempt, exactly the bug from the 2026-06-29 13:27 incident).
+    #[test]
+    fn resource_failure_wrapping_6005_is_detected() {
+        let inner = Arc::new(PushError::AuthInvalid(IDSError(6005)));
+        let rf = rustpush::ResourceFailure {
+            retry_wait: Some(300),
+            error: inner,
+        };
+        let err = PushError::ResourceFailure(rf);
+        assert!(
+            is_6005_error(&err),
+            "ResourceFailure wrapping AuthInvalid(6005) must be detected as 6005"
+        );
+    }
+
+    /// `ResourceFailure` wrapping a non-6005 error must NOT be detected.
+    /// (E.g., a permanent network error wrapped in ResourceFailure should
+    /// not trigger the cert self-heal.)
+    #[test]
+    fn resource_failure_wrapping_non_6005_is_not_detected() {
+        let inner = Arc::new(PushError::AuthInvalid(IDSError(9999)));
+        let rf = rustpush::ResourceFailure {
+            retry_wait: Some(300),
+            error: inner,
+        };
+        let err = PushError::ResourceFailure(rf);
+        assert!(
+            !is_6005_error(&err),
+            "ResourceFailure wrapping AuthInvalid(9999) must NOT be detected as 6005"
+        );
+    }
+
+    /// `DoNotRetry(ResourceFailure(AuthInvalid(6005)))` — the doubly-wrapped
+    /// form seen in the delivered-receipt / typing / read-receipt warnings
+    /// in the production logs — must also be detected (recurses through
+    /// both `DoNotRetry` and `ResourceFailure`).
+    #[test]
+    fn do_not_retry_wrapping_resource_failure_with_6005_is_detected() {
+        let inner = Arc::new(PushError::AuthInvalid(IDSError(6005)));
+        let rf = rustpush::ResourceFailure {
+            retry_wait: Some(300),
+            error: inner,
+        };
+        let err = PushError::DoNotRetry(Box::new(PushError::ResourceFailure(rf)));
+        assert!(
+            is_6005_error(&err),
+            "DoNotRetry(ResourceFailure(AuthInvalid(6005))) must be detected as 6005"
+        );
     }
 }
 
