@@ -139,5 +139,5 @@ fn make_backend() -> Arc<dyn Backend> {
 /// rustpush linked.
 #[cfg(not(feature = "rustpush"))]
 fn make_backend() -> Arc<dyn Backend> {
-    Arc::new(protocol::stub::StubBackend)
+    Arc::new(protocol::stub::StubBackend::default())
 }

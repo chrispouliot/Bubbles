@@ -1686,6 +1686,8 @@ impl Ui {
             .build();
         {
             let config_path = config_path.clone();
+            let backend = self.backend.clone();
+            let store = self.store.clone();
             cloud_sync_switch.connect_active_notify(move |switch| {
                 let new_config = crate::sync::BubblesConfig {
                     cloud_sync_enabled: switch.is_active(),
@@ -1694,6 +1696,33 @@ impl Ui {
                     log::warn!("failed to write config: {e}");
                 } else {
                     log::info!("cloud_sync_enabled toggled to {}", switch.is_active());
+                }
+
+                // When enabling cloud sync, ensure the iCloud Keychain clique
+                // is set up so subsequent syncs can use it.
+                #[cfg(feature = "rustpush")]
+                if switch.is_active() {
+                    let backend = backend.clone();
+                    let store = store.clone();
+                    crate::runtime::runtime().spawn(async move {
+                        let password_prompt =
+                            build_password_prompt_closure(None);
+                        match crate::protocol::rustpush_backend::orchestrate_sync_now_flow(
+                            &*backend,
+                            &store,
+                            i64::MIN,
+                            true,
+                            password_prompt,
+                        )
+                        .await
+                        {
+                            Ok(result) => log::info!(
+                                "cloud sync toggle: setup + sync completed ({} messages)",
+                                result.messages_processed
+                            ),
+                            Err(e) => log::error!("cloud sync toggle: {e}"),
+                        }
+                    });
                 }
             });
         }
@@ -1729,6 +1758,7 @@ impl Ui {
                 let store = self.store.clone();
                 let status_label = sync_now_status.clone();
                 let button = sync_now_button.clone();
+                let window = self.window.clone();
                 sync_now_button.connect_clicked(move |btn| {
                     btn.set_sensitive(false);
                     status_label.set_text("Syncing…");
@@ -1736,15 +1766,28 @@ impl Ui {
                     let store = store.clone();
                     let status_label = status_label.clone();
                     let button = button.clone();
-                    // Run the sync on the Tokio runtime (it touches hyper, which
-                    // requires a reactor — `glib::spawn_future_local` doesn't
-                    // provide one and would panic). Bridge the result back to
-                    // the glib main thread for the UI update.
+                    // Pre-build the password prompt closure while on the GTK
+                    // main thread, so we can capture the parent window.
+                    let parent = window
+                        .borrow()
+                        .as_ref()
+                        .and_then(|w| w.downcast_ref::<adw::Window>().cloned());
+                    let password_prompt =
+                        build_password_prompt_closure(parent.as_ref());
+                    // Run the orchestrator on the Tokio runtime (it touches
+                    // hyper, which requires a reactor — `glib::spawn_future_local`
+                    // doesn't provide one and would panic). Bridge the result
+                    // back to the glib main thread for the UI update.
                     let (tx, rx) = oneshot::channel();
                     crate::runtime::runtime().spawn(async move {
-                        let result = backend
-                            .sync_missed_messages(&store, i64::MIN, true)
-                            .await;
+                        let result = crate::protocol::rustpush_backend::orchestrate_sync_now_flow(
+                            &*backend,
+                            &store,
+                            i64::MIN,
+                            true,
+                            password_prompt,
+                        )
+                        .await;
                         let _ = tx.send(result);
                     });
                     glib::spawn_future_local(async move {
@@ -1757,10 +1800,18 @@ impl Ui {
                                 return;
                             }
                         };
-                        let summary = match result.messages_processed {
-                            0 => "No new messages".to_string(),
-                            1 => "Synced 1 message".to_string(),
-                            n => format!("Synced {n} messages"),
+                        let summary = match result {
+                            Ok(sync_result) => match sync_result.messages_processed {
+                                0 => "No new messages".to_string(),
+                                1 => "Synced 1 message".to_string(),
+                                n => format!("Synced {n} messages"),
+                            },
+                            Err(e) => {
+                                log::error!("manual sync: {e}");
+                                status_label.set_text(&format!("Sync failed: {e}"));
+                                button.set_sensitive(true);
+                                return;
+                            }
                         };
                         status_label.set_text(&summary);
                         log::info!("manual sync: {summary}");
@@ -7920,6 +7971,133 @@ mod avatar_save_tests {
         assert!(avatar_path.exists(), "avatar file should exist");
         let written = std::fs::read(&avatar_path).unwrap();
         assert_eq!(written, vec![1, 2, 3, 4], "file content should match the bytes passed to Replace");
+    }
+}
+
+/// Build an `adw::AlertDialog` for prompting the user for their iCloud
+/// account password (the "device password" used by
+/// `Backend::setup_keychain_clique`). The dialog is pre-populated with
+/// the expected title, body, and a password entry. The caller is
+/// responsible for presenting the dialog (`dialog.present(Some(parent))`)
+/// and wiring the response handling.
+///
+/// The dialog has:
+/// - Title: "iCloud Account Password"
+/// - Body: "Enter your iCloud account password to set up iCloud Keychain
+///   on this device. This is required to sync iMessage history from
+///   iCloud."
+/// - A password entry widget (`gtk::PasswordEntry`)
+/// - "Cancel" button (response id: "cancel")
+/// - "Set Up" button (response id: "suggested", default appearance)
+#[allow(dead_code)]
+pub fn build_clique_password_dialog(_parent: Option<&adw::Window>) -> adw::AlertDialog {
+    let dialog = adw::AlertDialog::new(
+        Some("iCloud Account Password"),
+        Some("Enter your iCloud account password to set up iCloud Keychain on this device. This is required to sync iMessage history from iCloud."),
+    );
+
+    let password_entry = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .build();
+    password_entry.set_placeholder_text(Some("Password"));
+
+    dialog.set_extra_child(Some(&password_entry));
+    dialog.add_responses(&[("cancel", "Cancel"), ("suggested", "Set Up")]);
+    dialog.set_response_appearance("suggested", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("suggested"));
+    dialog.set_close_response("cancel");
+
+    dialog
+}
+
+/// Build a closure suitable for the `password_prompt` parameter of
+/// `orchestrate_sync_now_flow`. The closure, when called, presents the
+/// iCloud Keychain password dialog, waits for the user's response, and
+/// returns the entered password (or `None` if the user cancelled).
+///
+/// `parent` is the parent window the dialog should be modal to.
+///
+/// The closure is `FnOnce` and synchronous — when called from a thread
+/// where blocking is acceptable (e.g., a tokio worker thread spawned
+/// via `crate::runtime::runtime().spawn`), it presents the dialog on
+/// the GTK main thread and blocks the calling thread until the user
+/// responds. This relies on glib's main-loop iteration during the
+/// blocking wait to drive the response callback.
+///
+/// # Thread safety
+///
+/// The returned closure is `Send` (captures no non-Send types) so it
+/// can be moved into a tokio task spawned via `runtime().spawn()`.
+/// Inside, it uses `glib::MainContext::default().invoke` to schedule
+/// the dialog presentation on the GTK main thread (this is the
+/// thread-safe way to do GTK work from a non-GTK thread — `spawn_local`
+/// panics with "already acquired by another thread" because the main
+/// context is owned by the GTK main thread), and then blocks the
+/// calling tokio worker thread on `rx.blocking_recv()` until the
+/// response callback fires on the main thread.
+#[allow(dead_code)]
+pub fn build_password_prompt_closure(
+    _parent: Option<&adw::Window>,
+) -> impl FnOnce() -> Option<String> {
+    // Discard the parent reference to avoid capturing a non-Send type.
+    // The dialog is presented without an explicit parent window.
+    let _ = _parent;
+    move || {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        // `glib::MainContext::default().invoke(...)` is the cross-thread way
+        // to run GTK code from a tokio worker. It posts a sync closure to
+        // the main context and blocks the calling thread until the main
+        // thread has executed it. The closure is just "present the
+        // dialog" — non-blocking from the main thread's perspective.
+        // The user response comes later via the dialog's response signal,
+        // which the main thread drives through its main loop while our
+        // tokio thread blocks on `rx.blocking_recv()`.
+        glib::MainContext::default().invoke(move || {
+            let dialog = build_clique_password_dialog(None);
+            // Wrap `tx` in a `RefCell<Option<...>>` so it can be taken
+            // once inside an `Fn` closure (signal handlers are `Fn`).
+            let tx = std::cell::RefCell::new(Some(tx));
+            dialog.connect_response(None, move |dialog, response_id| {
+                let password = if response_id == "suggested" {
+                    dialog
+                        .extra_child()
+                        .and_downcast::<gtk::PasswordEntry>()
+                        .map(|entry| entry.text().to_string())
+                } else {
+                    None
+                };
+                if let Some(tx) = tx.borrow_mut().take() {
+                    let _ = tx.send(password);
+                }
+            });
+            dialog.present(None::<&gtk::Window>);
+        });
+        rx.blocking_recv().ok().flatten()
+    }
+}
+
+#[cfg(test)]
+mod clique_password_dialog_tests {
+    use super::*;
+
+    /// Compile-time signature check: `build_clique_password_dialog` must exist
+    /// with the expected signature. GTK widget instantiation requires a display,
+    /// so this test only verifies the function is callable with the right types.
+    #[test]
+    fn build_clique_password_dialog_exists() {
+        let _: fn(Option<&adw::Window>) -> adw::AlertDialog = build_clique_password_dialog;
+    }
+
+    /// Compile-time signature check: `build_password_prompt_closure` must exist
+    /// with the expected signature. GTK dialog interaction requires a display,
+    /// so this test only verifies the function is callable with the right types
+    /// and returns a closure matching the `FnOnce() -> Option<String>` contract
+    /// required by `orchestrate_sync_now_flow`.
+    #[test]
+    fn build_password_prompt_closure_exists() {
+        fn _assert_prompt_type(_: impl FnOnce() -> Option<String>) {}
+        let closure = build_password_prompt_closure(None);
+        _assert_prompt_type(closure);
     }
 }
 

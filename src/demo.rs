@@ -34,7 +34,7 @@ pub fn build_demo_window(app: &adw::Application) -> adw::ApplicationWindow {
         store
     });
 
-    let backend: Arc<dyn Backend> = Arc::new(StubBackend);
+    let backend: Arc<dyn Backend> = Arc::new(StubBackend::default());
     let connection = Connection::new(());
     let client = ImClient::new(());
     let handles = vec![ME.to_string()];

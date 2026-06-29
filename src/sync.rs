@@ -404,7 +404,13 @@ pub struct BubblesConfig {
 impl BubblesConfig {
     pub fn default() -> Self {
         Self {
-            cloud_sync_enabled: true,
+            // Default to false: iCloud Keychain requires joining the user's
+            // encryption trust group (the "clique") before CloudKit sync can
+            // succeed, and bubbles doesn't yet expose the setup flow. Enabling
+            // it by default would surface a `NotInClique` error on every
+            // sync attempt. Users opt in via the settings switch once the
+            // setup flow lands.
+            cloud_sync_enabled: false,
         }
     }
 }
@@ -1153,7 +1159,7 @@ mod tests {
         let config = BubblesConfig::default();
         write_config(&path, &config).unwrap();
         let loaded = read_config(&path);
-        assert!(loaded.cloud_sync_enabled);
+        assert!(!loaded.cloud_sync_enabled, "default is now opt-in: cloud_sync_enabled is false until the user enables it");
     }
 
     #[test]

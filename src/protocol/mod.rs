@@ -405,6 +405,34 @@ pub trait Backend: Send + Sync {
         cutoff_ms: i64,
         force: bool,
     ) -> crate::sync::SyncResult;
+
+    // --- 9. keychain clique setup ---
+
+    /// Join the iCloud Keychain encryption trust group ("clique") using the
+    /// user's iCloud account password as the device password. This is
+    /// required before any CloudKit-based sync (iMessage in iCloud, keychain
+    /// sync) can succeed. Idempotent: if the clique is already set up,
+    /// returns `Ok(())` without making any network calls.
+    ///
+    /// Errors are surfaced as a string describing what went wrong. A more
+    /// typed error can come in a follow-up; for now `Result<(), String>` is
+    /// fine because the caller in the UI only displays the error message.
+    #[allow(dead_code)]
+    async fn setup_keychain_clique(
+        &self,
+        password: &str,
+    ) -> std::result::Result<(), String>;
+
+    /// Returns `true` if the iCloud Keychain clique is set up on this device,
+    /// `false` if it is not. This is a *disk-only* check — it reads the
+    /// persisted `keychain.plist` and reports whether a user identity is
+    /// present. It does NOT make any network calls and does NOT require the
+    /// AppleAccount to be reconstructed.
+    ///
+    /// Used by the UI to decide whether to prompt the user for their iCloud
+    /// password (clique not set up) before triggering a CloudKit sync.
+    #[allow(dead_code)]
+    async fn is_keychain_clique_set_up(&self) -> bool;
 }
 
 /// Walk the error chain and return the [`SendErrorCategory`] that best
@@ -439,5 +467,63 @@ pub fn friendly_category_message(cat: SendErrorCategory) -> String {
         SendErrorCategory::Timeout => "Connection timed out. Please try again.".into(),
         SendErrorCategory::ConnectionLost => "Lost connection. Please try again.".into(),
         SendErrorCategory::Other => "Couldn't send. Please try again.".into(),
+    }
+}
+
+/// What the UI should do when the user requests a CloudKit sync.
+/// The function checks whether the iCloud Keychain clique is set up and
+/// returns the appropriate action.
+///
+/// - [`CliqueSetupAction::SyncNow`] — the clique is set up, the caller should
+///   proceed with the sync (no password needed).
+/// - [`CliqueSetupAction::PromptForPassword`] — the clique is not set up, the
+///   caller should show the password dialog, and on user-submit call
+///   `run_clique_setup_then_sync` with `password = Some(...)`.
+/// - [`CliqueSetupAction::Abort`] — the backend cannot service the request
+///   (e.g., account not reconstructed). The caller should display the reason
+///   and abort.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliqueSetupAction {
+    /// The clique is set up; proceed with the sync.
+    SyncNow,
+    /// The clique is not set up; prompt for a password.
+    PromptForPassword,
+    /// The backend cannot service the request.
+    Abort(String),
+}
+
+/// Decide what the UI should do when the user requests a CloudKit sync.
+///
+/// This function is testable without a display because it doesn't touch GTK.
+/// It only calls the backend's [`Backend::is_keychain_clique_set_up`] method.
+///
+/// # Stub (to be filled in)
+///
+/// TODO: implement the real body — check `is_keychain_clique_set_up` and
+/// return the appropriate variant.  The test currently fails because this
+/// function returns a placeholder value.
+#[allow(dead_code)]
+pub async fn decide_clique_setup_action(backend: &dyn Backend) -> CliqueSetupAction {
+    if backend.is_keychain_clique_set_up().await {
+        CliqueSetupAction::SyncNow
+    } else {
+        CliqueSetupAction::PromptForPassword
+    }
+}
+
+#[cfg(test)]
+mod clique_setup_action_tests {
+    use super::*;
+    use crate::protocol::stub::StubBackend;
+
+    /// Pin: `decide_clique_setup_action` exists and, when called with a
+    /// `StubBackend` whose `is_keychain_clique_set_up` returns `false`,
+    /// returns `CliqueSetupAction::PromptForPassword`.
+    #[tokio::test]
+    async fn stub_backend_returns_prompt_for_password() {
+        let backend = StubBackend::default();
+        let action = decide_clique_setup_action(&backend).await;
+        assert_eq!(action, CliqueSetupAction::PromptForPassword);
     }
 }

@@ -1296,6 +1296,217 @@ impl Backend for RustpushBackend {
 
         crate::sync::sync_once(&msg_client, store, &my_handles, &chat_map, cutoff_ms).await
     }
+
+    async fn setup_keychain_clique(
+        &self,
+        password: &str,
+    ) -> std::result::Result<(), String> {
+        let dir = std::path::PathBuf::from(&self.state_path);
+
+        // If the in-memory session isn't populated yet, reconstruct it
+        // from gsa.plist first. This is the same path `sync_missed_messages`
+        // uses, and it's needed because the new `orchestrate_sync_now_flow`
+        // may call `setup_keychain_clique` *before* any sync has happened
+        // (e.g., the first time the user toggles cloud sync on). We pass
+        // `force: true` so the `cloud_sync_enabled` and backoff gates
+        // don't apply: the setup is always triggered by an explicit user
+        // action (the user entered a password and clicked "Set Up"), so
+        // the gates are not relevant here — the user has already opted
+        // in by entering their password.
+        if self.account.lock().unwrap().is_none()
+            && self.reconstruct_account(true).await.is_err()
+        {
+            return Err("account not reconstructed: sign in first".to_string());
+        }
+
+        // Need the in-memory session handles to build a TokenProvider.
+        let account = self.account.lock().unwrap().clone();
+        let anisette = self.anisette.lock().unwrap().clone();
+        let config = self.config.lock().unwrap().clone();
+        let (account, anisette, config) = match (account, anisette, config) {
+            (Some(a), Some(an), Some(c)) => (a, an, c),
+            _ => {
+                return Err(
+                    "account not reconstructed: sign in first".to_string(),
+                );
+            }
+        };
+
+        // Build Arc<dyn OSConfig> from the JoinedOSConfig.
+        let config_arc: Arc<dyn OSConfig> = match &config {
+            api::JoinedOSConfig::MacOS(conf) => conf.clone(),
+            api::JoinedOSConfig::Relay(conf) => conf.clone(),
+        };
+
+        // Build a TokenProvider from the AppleAccount.
+        let token_provider = TokenProvider::new(account.clone(), config_arc.clone());
+
+        // Read persisted Keychain state from disk (written by do_login).
+        let keychain_state: rustpush::keychain::KeychainClientState =
+            match plist::from_file(dir.join("keychain.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!("read keychain state: {e}"));
+                }
+            };
+
+        // Read persisted CloudKit state from disk for the CloudKitClient.
+        let cloudkit_state: rustpush::cloudkit::CloudKitState =
+            match plist::from_file(dir.join("cloudkit.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!("read cloudkit state: {e}"));
+                }
+            };
+
+        // Build a CloudKitClient (required by KeychainClient).
+        let ck_client: Arc<rustpush::cloudkit::CloudKitClient<_>> = Arc::new(
+            rustpush::cloudkit::CloudKitClient {
+                state: DebugRwLock::new(cloudkit_state),
+                anisette: anisette.clone(),
+                config: config_arc.clone(),
+                token_provider: token_provider.clone(),
+            },
+        );
+
+        // Build the KeychainClient, wired to persist state changes back to
+        // disk via the `update_state` callback.
+        let kc_path = dir.join("keychain.plist");
+        let keychain = rustpush::keychain::KeychainClient {
+            anisette: anisette.clone(),
+            token_provider: token_provider.clone(),
+            state: DebugRwLock::new(keychain_state),
+            config: config_arc.clone(),
+            update_state: Box::new(move |update| {
+                if let Err(e) = plist::to_file_xml(&kc_path, update) {
+                    log::warn!(
+                        "setup_keychain_clique: failed to write keychain.plist: {e}"
+                    );
+                }
+            }),
+            container: Mutex::new(None),
+            security_container: Mutex::new(None),
+            client: ck_client.clone(),
+        };
+
+        // Idempotent: if already in the clique, nothing to do.
+        if keychain.is_in_clique().await {
+            return Ok(());
+        }
+
+        // Create a new keychain identity.
+        let identity = keychain
+            .new_user_identity(false)
+            .await
+            .map_err(|e| format!("create identity: {e:?}"))?;
+
+        // Join the clique with the device password.
+        keychain
+            .join_clique(
+                password.as_bytes(),
+                &identity,
+                None,
+                &[],
+                vec![],
+            )
+            .await
+            .map_err(|e| format!("join clique: {e:?}"))?;
+
+        Ok(())
+    }
+
+    async fn is_keychain_clique_set_up(&self) -> bool {
+        let path = std::path::PathBuf::from(&self.state_path).join("keychain.plist");
+        let dict: plist::Dictionary = match plist::from_file(&path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        dict.contains_key("user_identity")
+    }
+}
+
+/// Run an iCloud sync, optionally setting up the iCloud Keychain clique
+/// first if a password is provided. The behavior is:
+///
+/// - If `password` is `Some(p)`, first call `setup_keychain_clique(p)`.
+///   If that fails, return the error (the sync is not attempted).
+/// - If `password` is `None`, skip the setup and proceed directly to the
+///   sync.
+/// - Then call `sync_missed_messages(store, cutoff_ms, force)` and
+///   return its result wrapped in `Ok(...)`.
+///
+/// This is the orchestrator the UI calls after the user submits the
+/// iCloud password dialog (or skips the dialog if the clique is already
+/// set up).
+#[allow(dead_code)]
+pub async fn run_clique_setup_then_sync(
+    backend: &dyn Backend,
+    store: &crate::store::Store,
+    cutoff_ms: i64,
+    force: bool,
+    password: Option<String>,
+) -> std::result::Result<crate::sync::SyncResult, String> {
+    // If a password was provided, set up the iCloud Keychain clique first.
+    // On error, return the error immediately without attempting the sync.
+    if let Some(p) = password {
+        backend.setup_keychain_clique(&p).await?;
+    }
+
+    // Run the missed-messages sync and wrap the result in Ok.
+    Ok(backend.sync_missed_messages(store, cutoff_ms, force).await)
+}
+
+/// Orchestrate the "Sync Now" or "toggle cloud sync on" user flow.
+///
+/// Called from the click handler (for "Sync Now") or the switch handler
+/// (for toggling `cloud_sync_enabled` to true). The function:
+///
+/// 1. Calls `decide_clique_setup_action(backend)` to check whether the
+///    iCloud Keychain clique is set up.
+/// 2. Based on the action:
+///    - `SyncNow` → proceeds directly to the sync (no password needed).
+///    - `PromptForPassword` → calls `password_prompt` to obtain a
+///      password. If the user submits a password, proceeds with the
+///      sync (after joining the clique via the orchestrator). If the
+///      user cancels, returns `Ok(SyncResult::default())` to indicate
+///      "no sync was attempted".
+///    - `Abort(reason)` → returns `Err(reason)`.
+///
+/// `password_prompt` is a closure (or function pointer) that the UI
+/// layer provides to show the password dialog and wait for the user's
+/// response. It returns `Some(password)` on submit, `None` on cancel.
+///
+/// The closure is run via `tokio::task::spawn_blocking` so it can
+/// safely block the calling thread (it blocks on the GTK main thread
+/// to present the dialog, then on a oneshot channel for the response).
+/// Running it directly on a tokio worker thread would deadlock the
+/// runtime ("Cannot block the current thread from within a runtime").
+#[allow(dead_code)]
+pub async fn orchestrate_sync_now_flow<F>(
+    backend: &dyn Backend,
+    store: &crate::store::Store,
+    cutoff_ms: i64,
+    force: bool,
+    password_prompt: F,
+) -> std::result::Result<crate::sync::SyncResult, String>
+where
+    F: FnOnce() -> Option<String> + Send + 'static,
+{
+    let action = crate::protocol::decide_clique_setup_action(backend).await;
+    let password = match action {
+        CliqueSetupAction::SyncNow => None,
+        CliqueSetupAction::PromptForPassword => {
+            match tokio::task::spawn_blocking(password_prompt).await {
+                Ok(Some(p)) => Some(p),
+                Ok(None) => return Ok(crate::sync::SyncResult::default()),
+                Err(join_err) => {
+                    return Err(format!("password prompt task failed: {join_err}"))
+                }
+            }
+        }
+        CliqueSetupAction::Abort(reason) => return Err(reason),
+    };
+    run_clique_setup_then_sync(backend, store, cutoff_ms, force, password).await
 }
 
 /// Spike-only: dump an inbound message's salient fields. `Message` doesn't
@@ -2641,5 +2852,201 @@ mod tests {
             }
             other => panic!("expected Ingest::Edited, got {other:?}"),
         }
+    }
+
+    /// Pin: `Backend::is_keychain_clique_set_up` — disk-only check on
+    /// `keychain.plist`.  Returns `false` when the file does not exist
+    /// (clique never set up, no persisted state at all).
+    #[tokio::test]
+    async fn is_keychain_clique_set_up_returns_false_when_no_plist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        assert!(!backend.is_keychain_clique_set_up().await);
+    }
+
+    /// Pin: `Backend::is_keychain_clique_set_up` — returns `false` when
+    /// `keychain.plist` exists but has no `user_identity` field (the clique
+    /// state was persisted but no user identity was ever created).
+    #[tokio::test]
+    async fn is_keychain_clique_set_up_returns_false_when_no_user_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keychain.plist");
+        plist::to_file_xml(&path, &plist::Dictionary::new()).unwrap();
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        assert!(!backend.is_keychain_clique_set_up().await);
+    }
+
+    /// Pin: `Backend::is_keychain_clique_set_up` — returns `true` when
+    /// `keychain.plist` exists and has a `user_identity` field (the clique
+    /// was set up and a user identity was persisted to disk).
+    #[tokio::test]
+    async fn is_keychain_clique_set_up_returns_true_when_user_identity_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keychain.plist");
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "user_identity".into(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
+        plist::to_file_xml(&path, &dict).unwrap();
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        assert!(backend.is_keychain_clique_set_up().await);
+    }
+
+    /// Pin: the free orchestrator `run_clique_setup_then_sync` exists with the
+    /// expected signature and, when `password` is `None`, skips the clique setup
+    /// and returns `Ok(SyncResult::default())` via the stub backend's no-op sync.
+    #[tokio::test]
+    async fn run_clique_setup_then_sync_no_password() {
+        let backend = crate::protocol::stub::StubBackend::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let result = super::run_clique_setup_then_sync(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), crate::sync::SyncResult::default());
+    }
+
+    /// Pin: `decide_clique_setup_action` — when `keychain.plist` exists with a
+    /// `user_identity` field, `is_keychain_clique_set_up` returns `true`, so
+    /// the action should be `SyncNow`.
+    #[tokio::test]
+    async fn decide_clique_setup_action_returns_sync_now_when_clique_set_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keychain.plist");
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "user_identity".into(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
+        plist::to_file_xml(&path, &dict).unwrap();
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        let action = crate::protocol::decide_clique_setup_action(&backend).await;
+        assert_eq!(action, crate::protocol::CliqueSetupAction::SyncNow);
+    }
+
+    /// Pin: `decide_clique_setup_action` — when `keychain.plist` does not
+    /// exist, `is_keychain_clique_set_up` returns `false`, so the action
+    /// should be `PromptForPassword`.
+    #[tokio::test]
+    async fn decide_clique_setup_action_returns_prompt_when_no_keychain_plist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = RustpushBackend::new(tmp.path().to_string_lossy().to_string());
+        let action = crate::protocol::decide_clique_setup_action(&backend).await;
+        assert_eq!(action, crate::protocol::CliqueSetupAction::PromptForPassword);
+    }
+
+    /// Pin: `orchestrate_sync_now_flow` — when the clique is not set up and
+    /// the user submits a password via the prompt closure, the function calls
+    /// `run_clique_setup_then_sync` with the password and returns `Ok(...)`.
+    /// Uses the stub backend's no-op implementations for both clique setup
+    /// and sync, so the result is `SyncResult::default()`.
+    #[tokio::test]
+    async fn orchestrate_sync_now_flow_prompt_with_password() {
+        let backend = crate::protocol::stub::StubBackend::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let result = super::orchestrate_sync_now_flow(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            || Some("test-password".to_string()),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), crate::sync::SyncResult::default());
+    }
+
+    /// Pin: `orchestrate_sync_now_flow` — when the clique is not set up and
+    /// the user cancels the password dialog (`password_prompt` returns `None`),
+    /// the function returns `Ok(SyncResult::default())` without attempting
+    /// any sync (the "cancelled" sentinel).
+    #[tokio::test]
+    async fn orchestrate_sync_now_flow_user_cancels() {
+        let backend = crate::protocol::stub::StubBackend::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let result = super::orchestrate_sync_now_flow(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            || None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), crate::sync::SyncResult::default());
+    }
+
+    /// Pin: `orchestrate_sync_now_flow` — when the action is
+    /// `PromptForPassword`, the `password_prompt` closure is invoked exactly
+    /// once.
+    #[tokio::test]
+    async fn orchestrate_sync_now_flow_prompt_calls_closure_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let backend = crate::protocol::stub::StubBackend::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+        let result = super::orchestrate_sync_now_flow(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some("password".to_string())
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "password_prompt closure should be called exactly once when action is PromptForPassword"
+        );
+    }
+
+    /// Pin: `orchestrate_sync_now_flow` — when the clique IS set up
+    /// (`StubBackend::clique_set_up = true`), the action is `SyncNow`, the
+    /// sync proceeds directly, and the `password_prompt` closure is NOT
+    /// called.
+    #[tokio::test]
+    async fn orchestrate_sync_now_flow_sync_now_skips_prompt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let backend = crate::protocol::stub::StubBackend { clique_set_up: true };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+        let result = super::orchestrate_sync_now_flow(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some("should-not-be-called".to_string())
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "password_prompt closure should NOT be called when clique is set up (SyncNow path)"
+        );
     }
 }

@@ -10,7 +10,16 @@ use super::*;
 
 /// Drives the flow down the trusted-device 2FA path and then to a logged-in
 /// state with one phone handle.
-pub struct StubBackend;
+///
+/// The `clique_set_up` field controls `is_keychain_clique_set_up`: when `true`
+/// the stub reports the clique is set up (`SyncNow` path); when `false` (the
+/// default) it reports not set up (`PromptForPassword` path). Tests that need
+/// the sync-now path set this to `true`; all existing tests use the default.
+#[derive(Default)]
+pub struct StubBackend {
+    /// If `true`, `is_keychain_clique_set_up` returns `true`.
+    pub clique_set_up: bool,
+}
 
 #[async_trait]
 impl Backend for StubBackend {
@@ -265,6 +274,17 @@ impl Backend for StubBackend {
     ) -> crate::sync::SyncResult {
         crate::sync::SyncResult::default()
     }
+
+    async fn setup_keychain_clique(
+        &self,
+        _password: &str,
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    async fn is_keychain_clique_set_up(&self) -> bool {
+        self.clique_set_up
+    }
 }
 
 #[allow(dead_code)]
@@ -289,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_attachment_without_caption() {
-        let backend = StubBackend;
+        let backend = StubBackend::default();
         let client = ImClient::new(());
         let connection = Connection::new(());
         let chat = sample_chat_ref();
@@ -327,7 +347,7 @@ mod tests {
         // reaction send is a no-op success).
         use rustpush::{ReactMessageType, Reaction};
 
-        let backend = StubBackend;
+        let backend = StubBackend::default();
         let client = ImClient::new(());
         let chat = sample_chat_ref();
         let my_handle = "tel:+15555550123";
@@ -366,7 +386,7 @@ mod tests {
         // payload (the whole point of the stub is offline iteration, so the
         // edit send is a no-op success).
 
-        let backend = StubBackend;
+        let backend = StubBackend::default();
         let client = ImClient::new(());
         let chat = sample_chat_ref();
         let my_handle = "tel:+15555550123";
@@ -395,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_attachment_with_caption() {
-        let backend = StubBackend;
+        let backend = StubBackend::default();
         let client = ImClient::new(());
         let connection = Connection::new(());
         let chat = sample_chat_ref();
@@ -443,5 +463,56 @@ mod tests {
             Some(&path),
             "attachment local_path should match the passed path"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_keychain_clique_returns_ok() {
+        // Pin: `Backend::setup_keychain_clique` exists on the trait with
+        // signature
+        //   `async fn setup_keychain_clique(&self, password: &str) -> Result<()>`
+        // and the `StubBackend` implementation returns `Ok(())` without making
+        // any network calls. This is the contract for the iCloud Keychain
+        // clique-setup unit. The stub is deliberately offline — it proves the
+        // trait method compiles and defaults to success for click-through
+        // iteration.
+        let backend = StubBackend::default();
+        let result = backend.setup_keychain_clique("test-password").await;
+        assert!(
+            result.is_ok(),
+            "StubBackend::setup_keychain_clique should return Ok(()) for any \
+             password, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_keychain_clique_set_up_stub_returns_false() {
+        // Pin: `Backend::is_keychain_clique_set_up` exists on the trait
+        // with signature `async fn is_keychain_clique_set_up(&self) -> bool`,
+        // and the `StubBackend` implementation returns `false` — the stub
+        // is offline and never has a real clique.  This is the offline
+        // counterpart to the production disk-check tests.
+        let backend = StubBackend::default();
+        assert!(!backend.is_keychain_clique_set_up().await);
+    }
+
+    #[cfg(feature = "rustpush")]
+    #[tokio::test]
+    async fn run_clique_setup_then_sync_with_password() {
+        // Pin: `run_clique_setup_then_sync` accepts a `Some(password)`, calls
+        // `setup_keychain_clique` (which always succeeds on the stub), then
+        // `sync_missed_messages`, and returns the sync result.
+        let backend = StubBackend::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let result = crate::protocol::rustpush_backend::run_clique_setup_then_sync(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            Some("test-password".to_string()),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), crate::sync::SyncResult::default());
     }
 }
