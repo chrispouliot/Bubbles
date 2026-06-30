@@ -114,7 +114,7 @@ impl RustpushBackend {
     /// post-failure backoff are bypassed. This is used by the manual "Sync
     /// Now" button so the user can pull missed messages on demand even when
     /// automatic cloud sync is disabled or the last sync hit the backoff.
-    async fn reconstruct_account(&self, force: bool) -> Result<(), ()> {
+    async fn reconstruct_account(&self, force: bool) -> Result<Option<IDSUser>, ()> {
         let conn_arc = self.conn.lock().unwrap().clone();
         let conn = match conn_arc {
             Some(c) => c,
@@ -197,18 +197,25 @@ impl RustpushBackend {
                 // 7-day MME window). Running do_login on every launch keeps
                 // the Apple account state fresh so rustpush's auto-rereg
                 // succeeds in the background.
-                if let Err(e) = api::do_login(
+                let new_user = match api::do_login(
                     self.state_path.clone(),
                     &account,
                     None,
                     &config,
                 ).await {
-                    log::warn!("reconstruct_account: do_login failed: {e:?}");
-                    // Continue anyway — the account is still partially usable, and
-                    // sync_missed_messages will report the failure clearly. Storing
-                    // the account lets a future attempt (e.g., on the next launch or
-                    // wake) try do_login again without re-doing try_auth.
-                }
+                    Ok(user) => {
+                        log::info!("reconstruct_account: do_login succeeded");
+                        Some(user)
+                    }
+                    Err(e) => {
+                        log::warn!("reconstruct_account: do_login failed: {e:?}");
+                        // Continue anyway — the account is still partially usable, and
+                        // sync_missed_messages will report the failure clearly. Storing
+                        // the account lets a future attempt (e.g., on the next launch or
+                        // wake) try do_login again without re-doing try_auth.
+                        None
+                    }
+                };
 
                 log::info!("reconstruct_account: successfully reconstructed AppleAccount");
                 // Clear any previous sync error — a successful reconstruction
@@ -219,7 +226,7 @@ impl RustpushBackend {
                     log::warn!("clear_last_sync_error failed: {e}");
                 }
                 *self.account.lock().unwrap() = Some(account);
-                Ok(())
+                Ok(new_user)
             }
             Err(e) => {
                 log::warn!("reconstruct_account: try_auth failed: {e:?}");
@@ -679,7 +686,6 @@ impl Backend for RustpushBackend {
     ) -> std::sync::Arc<tokio::sync::Notify> {
         let conn = conn(connection).conn.clone();
         let imclient = client(c).clone();
-        let state_path = self.state_path.clone();
         let kick = std::sync::Arc::new(tokio::sync::Notify::new());
         let kick_spawn = std::sync::Arc::clone(&kick);
         crate::runtime::runtime().spawn(async move {
@@ -697,22 +703,13 @@ impl Backend for RustpushBackend {
 
             let reconnect = {
                 let state = std::sync::Arc::clone(&state);
-                let path = state_path.clone();
                 move || {
                     let state = std::sync::Arc::clone(&state);
-                    let path = path.clone();
                     async move {
-                        let saved = api::read_hardware(path.clone())
-                            .ok_or_else(|| ReconnectError("read_hardware returned None".to_string()))?;
-                        let identity = api::decode_identity(&saved.identity)
-                            .map_err(|e| ReconnectError(format!("decode_identity failed: {e}")))?;
-                        let config = saved.os_config;
-                        let (new_conn, err) = api::setup_push(&config, &identity, Some(saved.push), path).await;
-                        if let Some(e) = err {
-                            log::warn!("setup_push returned a non-fatal error: {e:?}");
-                        }
-                        *state.lock().expect("connection mutex poisoned") = new_conn;
-                        log::info!("connection re-established");
+                        let conn = state.lock().expect("connection mutex poisoned").clone();
+                        conn.inner().refresh_now().await
+                            .map_err(|e| ReconnectError(format!("refresh failed: {e}")))?;
+                        log::info!("connection re-established via refresh");
                         Ok(())
                     }
                 }
@@ -896,7 +893,15 @@ impl Backend for RustpushBackend {
                     let mut guard = inst.lock().await;
                     imclient.send(&mut guard).await
                 };
-                match imclient.identity.refresh().await {
+                // Use `refresh_now` (not `refresh`) — `refresh` signals on
+                // `retry_signal`, which the ResourceManager's backoff sleep
+                // does not wait on, so a refresh-while-backoff just times
+                // out at MAX_RESOURCE_WAIT (30s). `refresh_now` signals on
+                // `retry_now_signal`, which the backoff sleep *does* wait
+                // on, so it actually wakes the sleep and triggers a fresh
+                // generation. Without this, the cert self-heal was a no-op
+                // every time the resource was in a backoff window.
+                match imclient.identity.refresh_now().await {
                     Ok(()) => {
                         log::info!("cert self-heal: re-register succeeded, retrying send");
                         retry_send().await
@@ -907,8 +912,28 @@ impl Backend for RustpushBackend {
                              trying do_login fallback (this may take a few seconds)"
                         );
                         match self.reconstruct_account(true).await {
-                            Ok(()) => {
-                                log::info!("cert self-heal: do_login fallback succeeded, retrying send");
+                            Ok(Some(new_user)) => {
+                                log::info!(
+                                    "cert self-heal: do_login fallback succeeded, \
+                                     updating IdentityResource and retrying send"
+                                );
+                                // Update the IMClient's IdentityResource with the
+                                // fresh user data from do_login. update_users
+                                // replaces the users list and triggers a
+                                // re-register (refresh_now), which uses the fresh
+                                // cert/key material from the new IDSUser.
+                                imclient.identity.resource.update_users(vec![new_user]).await.ok();
+                                retry_send().await
+                            }
+                            Ok(None) => {
+                                // do_login failed but try_auth succeeded — the
+                                // account is reconstructed but no fresh user data
+                                // is available. Retry the send with whatever state
+                                // exists.
+                                log::warn!(
+                                    "cert self-heal: do_login returned no user, \
+                                     retrying send anyway"
+                                );
                                 retry_send().await
                             }
                             Err(()) => {
