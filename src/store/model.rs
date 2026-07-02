@@ -54,6 +54,9 @@ pub struct IncomingMessage {
     pub item_type: i64,
     /// Files attached to this message (already downloaded to `local_path`).
     pub attachments: Vec<AttachmentRecord>,
+    /// Whether this message is still pending/in-flight (hasn't been confirmed
+    /// sent by the server).  Default `false` via `..Default::default()`.
+    pub pending: bool,
 }
 
 /// An attachment as ingested: metadata plus a local file we've already saved.
@@ -195,6 +198,7 @@ pub struct StoredMessage {
     pub associated_type: Option<i64>,
     pub item_type: i64,
     pub send_error: Option<SendErrorCategory>,
+    pub pending: bool,
     pub attachments: Vec<StoredAttachment>,
 }
 

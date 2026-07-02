@@ -144,6 +144,12 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         c.execute_batch("ALTER TABLE chat ADD COLUMN custom_avatar_path TEXT;")?;
         v = 5;
     }
+    if v < 6 {
+        // Pending/in-flight send state: tracks messages that haven't been
+        // confirmed sent by the server yet.
+        c.execute_batch("ALTER TABLE message ADD COLUMN pending INTEGER NOT NULL DEFAULT 0;")?;
+        v = 6;
+    }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
 }
@@ -254,11 +260,11 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
     c.execute(
         "INSERT OR IGNORE INTO message
            (guid, chat_id, sender_handle_id, is_from_me, text, subject, service, date,
-            effect, reply_to_guid, reply_part, item_type)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            effect, reply_to_guid, reply_part, item_type, pending)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             m.guid, chat_id, sender_id, m.is_from_me as i64, m.text, m.subject, m.service,
-            m.date, m.effect, m.reply_to_guid, m.reply_part, m.item_type
+            m.date, m.effect, m.reply_to_guid, m.reply_part, m.item_type, m.pending as i64
         ],
     )?;
     // Attach files only on first insert (fan-out duplicates reuse the guid).
@@ -423,7 +429,7 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
         Ingest::LinkPreview(p) => upsert_message_link_preview(&tx, &p)?,
         Ingest::Receipt(Receipt::Delivered { guid, date }) => {
             tx.execute(
-                "UPDATE message SET date_delivered = ?1
+                "UPDATE message SET date_delivered = ?1, pending = 0, error = NULL
                  WHERE guid = ?2 AND date_delivered IS NULL",
                 params![date, guid],
             )?;
@@ -445,7 +451,7 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
                 Some((0, chat_id, msg_date)) => mark_read_through(&tx, chat_id, msg_date)?,
                 _ => {
                     tx.execute(
-                        "UPDATE message SET date_read = ?1
+                        "UPDATE message SET date_read = ?1, pending = 0, error = NULL
                          WHERE guid = ?2 AND date_read IS NULL",
                         params![date, guid],
                     )?;
@@ -454,7 +460,7 @@ pub fn apply_blocking(c: &mut Connection, ingest: Ingest) -> rusqlite::Result<()
         }
         Ingest::SendFailed { guid, category } => {
             tx.execute(
-                "UPDATE message SET error = ?1 WHERE guid = ?2",
+                "UPDATE message SET error = ?1, pending = 0 WHERE guid = ?2",
                 params![category as i64, guid],
             )?;
         }
@@ -531,7 +537,7 @@ pub fn query_chats(c: &Connection) -> rusqlite::Result<Vec<ChatSummary>> {
 /// Columns selected for a `StoredMessage`, in the order [`map_message_row`] expects.
 const MSG_COLS: &str = "m.id, m.guid, m.chat_id, h.address, m.is_from_me, m.text, m.subject, \
      m.service, m.date, m.date_delivered, m.date_read, m.effect, m.reply_to_guid, m.reply_part, \
-     m.associated_guid, m.associated_type, m.item_type, m.error";
+     m.associated_guid, m.associated_type, m.item_type, m.error, m.pending";
 
 fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
     Ok(StoredMessage {
@@ -553,6 +559,7 @@ fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         associated_type: r.get(15)?,
         item_type: r.get(16)?,
         send_error: SendErrorCategory::from_i64(r.get::<_, Option<i64>>(17)?),
+        pending: r.get::<_, i64>(18)? != 0,
         attachments: Vec::new(),
     })
 }
@@ -719,6 +726,26 @@ impl Store {
             // Clear any unread that a later sent message already implies we read,
             // in case those events were missed while this device was offline.
             reconcile_implicit_reads(c)?;
+            // Repair: rows with delivery evidence (date_delivered or date_read)
+            // should never be in-flight or failed — clear both states.  This
+            // handles the case where a message was delivered but a late
+            // SendFailed or a crash left stale state behind.
+            c.execute(
+                "UPDATE message SET pending = 0, error = NULL
+                 WHERE (date_delivered IS NOT NULL OR date_read IS NOT NULL)
+                   AND (pending = 1 OR error IS NOT NULL)",
+                [],
+            )?;
+            // Orphan sweep: any message still pending without delivery evidence
+            // (e.g. after a crash before send completion) is marked as failed
+            // so it's not left in-flight forever.
+            c.execute(
+                "UPDATE message SET pending = 0, error = ?1
+                 WHERE pending = 1
+                   AND date_delivered IS NULL
+                   AND date_read IS NULL",
+                params![SendErrorCategory::Other as i64],
+            )?;
             Ok(())
         })
         .await?;
@@ -734,6 +761,36 @@ impl Store {
         })
         .await?;
         Ok(Self { conn })
+    }
+
+    /// Mark a pending message as successfully sent (clear its pending flag).
+    pub async fn mark_sent(&self, guid: &str) -> Result<()> {
+        let guid = guid.to_owned();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE message SET pending = 0 WHERE guid = ?1",
+                    params![guid],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Reset a failed message back to in-flight: pending=1, error=NULL.
+    pub async fn mark_retrying(&self, guid: &str) -> Result<()> {
+        let guid = guid.to_owned();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE message SET pending = 1, error = NULL WHERE guid = ?1",
+                    params![guid],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn apply(&self, ingest: Ingest) -> Result<()> {
@@ -1929,7 +1986,7 @@ mod tests {
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 5, "user_version must be 5 after migration");
+        assert_eq!(v, 6, "user_version must be 6 after migration");
     }
 
     #[test]
@@ -1972,5 +2029,335 @@ mod tests {
         assert_eq!(msgs.len(), 1, "edit did not insert a phantom row");
         assert_eq!(msgs[0].guid, "EXISTS");
         assert_eq!(msgs[0].text.as_deref(), Some("From me"));
+    }
+
+    // -------------------------------------------------------------------
+    // Pending/in-flight send state (v6)
+    // -------------------------------------------------------------------
+    //
+    // Contract (symbols do not exist yet — compile errors = intentional red):
+    //   1. IncomingMessage.pending: bool (default false via ..Default::default())
+    //   2. StoredMessage.pending: bool (read back from queries)
+    //   3. Store::mark_sent(guid: &str) -> async Result<()> clears pending
+    //   4. Ingest::SendFailed on a pending message clears pending AND sets error
+    //   5. Store::open orphan-sweep: pending messages at open get marked as failed
+    //
+    // All fail to compile until the new field/method lands.
+
+    #[tokio::test]
+    async fn pending_send_state_message_with_pending_true() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("PEND-TRUE", 1000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].pending);
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_message_with_pending_false() {
+        let store = Store::open_in_memory().await.unwrap();
+        let m = sent("PEND-FALSE", 2000);
+        store.apply(Ingest::Message(m)).await.unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs[0].pending);
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_mark_sent() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("MARK-SENT", 3000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+        store.mark_sent("MARK-SENT").await.unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs[0].pending);
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_send_failed_clears_pending() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("FAIL-PEND", 4000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+        store
+            .apply(Ingest::SendFailed {
+                guid: "FAIL-PEND".into(),
+                category: SendErrorCategory::Timeout,
+            })
+            .await
+            .unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs[0].pending);
+        assert_eq!(msgs[0].send_error, Some(SendErrorCategory::Timeout));
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_orphan_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bubbles.db");
+
+        // First open: insert one pending and one non-pending (sent) message.
+        let store = Store::open(&db_path).await.unwrap();
+        let mut pending_msg = sent("PEND-SWEEP", 5000);
+        pending_msg.pending = true;
+        store.apply(Ingest::Message(pending_msg)).await.unwrap();
+        store.apply(Ingest::Message(sent("SENT-SWEEP", 6000))).await.unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 2, "both messages inserted on first open");
+        drop(store);
+
+        // Reopen — the orphan sweep must mark the pending message as failed.
+        let store = Store::open(&db_path).await.unwrap();
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 2, "reopen sees both messages");
+
+        let pend = msgs.iter().find(|m| m.guid == "PEND-SWEEP").unwrap();
+        assert!(!pend.pending, "orphan sweep cleared pending");
+        assert_eq!(pend.send_error, Some(SendErrorCategory::Other));
+
+        let sent = msgs.iter().find(|m| m.guid == "SENT-SWEEP").unwrap();
+        assert!(!sent.pending, "non-pending message not pending");
+        assert_eq!(sent.send_error, None, "non-pending message not marked failed");
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_mark_retrying() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("RETRY-GUID", 7000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+        // Fail the message first.
+        store
+            .apply(Ingest::SendFailed {
+                guid: "RETRY-GUID".into(),
+                category: SendErrorCategory::Timeout,
+            })
+            .await
+            .unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+
+        // Confirm it is failed before retry.
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        let msg = msgs.iter().find(|m| m.guid == "RETRY-GUID").unwrap();
+        assert!(!msg.pending);
+        assert_eq!(msg.send_error, Some(SendErrorCategory::Timeout));
+        assert_eq!(msg.text.as_deref(), Some("From me"));
+
+        // Retry: reset to in-flight.
+        store.mark_retrying("RETRY-GUID").await.unwrap();
+
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        let msg = msgs.iter().find(|m| m.guid == "RETRY-GUID").unwrap();
+        assert!(msg.pending, "retry sets pending back to true");
+        assert_eq!(msg.send_error, None, "retry clears send_error");
+        assert_eq!(msg.text.as_deref(), Some("From me"), "other fields intact");
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_delivered_receipt_clears_pending() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("PEND-DEL-GUID", 8000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+
+        store
+            .apply(Ingest::Receipt(Receipt::Delivered {
+                guid: "PEND-DEL-GUID".into(),
+                date: 8500,
+            }))
+            .await
+            .unwrap();
+
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        let msg = msgs.iter().find(|m| m.guid == "PEND-DEL-GUID").unwrap();
+        // Fails today: Delivered receipt does not clear pending.
+        assert!(!msg.pending, "Delivered receipt must clear pending");
+        assert_eq!(
+            msg.date_delivered,
+            Some(8500),
+            "date_delivered must be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_read_receipt_clears_pending() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("PEND-READ-GUID", 9000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+
+        store
+            .apply(Ingest::Receipt(Receipt::Read {
+                guid: "PEND-READ-GUID".into(),
+                date: 9500,
+            }))
+            .await
+            .unwrap();
+
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        let msg = msgs.iter().find(|m| m.guid == "PEND-READ-GUID").unwrap();
+        // Fails today: Read receipt does not clear pending.
+        assert!(!msg.pending, "Read receipt must clear pending");
+        assert_eq!(msg.date_read, Some(9500), "date_read must be set");
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_receipt_clears_stale_error() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut m = sent("PEND-ERR-GUID", 10000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+
+        // Fail the message.
+        store
+            .apply(Ingest::SendFailed {
+                guid: "PEND-ERR-GUID".into(),
+                category: SendErrorCategory::Other,
+            })
+            .await
+            .unwrap();
+
+        // Now a Delivered receipt arrives — this should clear the stale error.
+        store
+            .apply(Ingest::Receipt(Receipt::Delivered {
+                guid: "PEND-ERR-GUID".into(),
+                date: 10500,
+            }))
+            .await
+            .unwrap();
+
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        let msg = msgs.iter().find(|m| m.guid == "PEND-ERR-GUID").unwrap();
+        // Fails today: receipt does not clear error (a delivered message cannot be failed).
+        assert!(
+            msg.send_error.is_none(),
+            "Delivered receipt must clear send_error"
+        );
+        assert!(!msg.pending, "pending must be false");
+        assert_eq!(
+            msg.date_delivered,
+            Some(10500),
+            "date_delivered must be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_orphan_sweep_spares_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bubbles.db");
+
+        let store = Store::open(&db_path).await.unwrap();
+        // Two pending messages.
+        let mut m1 = sent("SWEEP-DEL-GUID", 11000);
+        m1.pending = true;
+        store.apply(Ingest::Message(m1)).await.unwrap();
+        let mut m2 = sent("SWEEP-ORPHAN-GUID", 12000);
+        m2.pending = true;
+        store.apply(Ingest::Message(m2)).await.unwrap();
+
+        // Deliver a receipt for the first one.
+        store
+            .apply(Ingest::Receipt(Receipt::Delivered {
+                guid: "SWEEP-DEL-GUID".into(),
+                date: 11500,
+            }))
+            .await
+            .unwrap();
+
+        drop(store);
+
+        // Reopen — the orphan sweep must not clobber the delivered row.
+        let store = Store::open(&db_path).await.unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 2, "both messages survive");
+
+        let delivered = msgs
+            .iter()
+            .find(|m| m.guid == "SWEEP-DEL-GUID")
+            .unwrap();
+        // Fails today: orphan sweep marks the delivered message as failed.
+        assert!(
+            delivered.send_error.is_none(),
+            "delivered message must not be marked failed"
+        );
+        assert!(!delivered.pending, "delivered message not pending");
+        assert_eq!(
+            delivered.date_delivered,
+            Some(11500),
+            "date_delivered preserved"
+        );
+
+        let orphan = msgs
+            .iter()
+            .find(|m| m.guid == "SWEEP-ORPHAN-GUID")
+            .unwrap();
+        // Existing sweep behaviour: undelivered pending message is marked failed.
+        assert!(!orphan.pending, "orphan sweep cleared pending");
+        assert_eq!(
+            orphan.send_error,
+            Some(SendErrorCategory::Other),
+            "orphan sweep marked undelivered as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_send_state_open_repairs_failed_but_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bubbles.db");
+
+        // Build a row that has both delivery evidence AND an error.
+        let store = Store::open(&db_path).await.unwrap();
+        let mut m = sent("REPAIR-GUID", 13000);
+        m.pending = true;
+        store.apply(Ingest::Message(m)).await.unwrap();
+
+        // Delivered receipt arrives first.
+        store
+            .apply(Ingest::Receipt(Receipt::Delivered {
+                guid: "REPAIR-GUID".into(),
+                date: 13500,
+            }))
+            .await
+            .unwrap();
+
+        // SendFiled always wins at apply time — it's fresh evidence. This creates
+        // the bad row: error=Some(Other) + date_delivered=Some(13500).
+        store
+            .apply(Ingest::SendFailed {
+                guid: "REPAIR-GUID".into(),
+                category: SendErrorCategory::Other,
+            })
+            .await
+            .unwrap();
+
+        drop(store);
+
+        // Reopen — the open-time repair must clear error on rows that have
+        // delivery evidence.
+        let store = Store::open(&db_path).await.unwrap();
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let msgs = store.messages_page(chat_id, None, 10).await.unwrap();
+        let msg = msgs.iter().find(|m| m.guid == "REPAIR-GUID").unwrap();
+        // Fails today: open does not repair error on delivered rows.
+        assert!(
+            msg.send_error.is_none(),
+            "open must clear send_error on a row with delivery evidence"
+        );
+        assert!(!msg.pending, "pending cleared by reopen");
+        assert_eq!(msg.date_delivered, Some(13500), "date_delivered preserved");
     }
 }

@@ -33,7 +33,7 @@ use rustpush::{
     EditMessage, IDSError, IDSNGMIdentity, IDSUser, IMClient, IdmsAuthListener,
     IndexedMessagePart, LPLinkMetadata, LinkMeta, LoginState as RpLoginState, MMCSFile,
     Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, OSConfig,
-    PushError, ReactMessage, Reaction, ReactMessageType, TokenProvider,
+    PushError, ReactMessage, Reaction, ReactMessageType, SendResult, TokenProvider,
     VerifyBody as RpVerifyBody,
 };
 
@@ -256,6 +256,17 @@ fn cfg(c: &Config) -> &api::JoinedOSConfig {
 fn conn(c: &Connection) -> &ConnHandle {
     c.downcast().expect("Connection holds ConnHandle")
 }
+
+/// Force-refresh the APS connection (e.g., after wake from sleep).
+///
+/// Re-establishes the underlying TCP/TLS connection to APNs so the receive
+/// loop can re-subscribe without waiting for the 60-second keepalive ping.
+pub async fn refresh_aps(connection: &Connection) -> anyhow::Result<()> {
+    let handle = conn(connection);
+    handle.conn.inner().refresh_now().await?;
+    log::info!("APS connection refreshed");
+    Ok(())
+}
 fn anis(a: &Anisette) -> &Anis {
     a.downcast().expect("Anisette holds ArcAnisetteClient")
 }
@@ -290,6 +301,32 @@ fn map_state(s: RpLoginState) -> LoginState {
     }
 }
 
+/// Map a `rustpush::ResourceState` to our facade `RegistrationStatus`.
+///
+/// This is a pure function — no I/O, no side effects. Wired into the receive
+/// loop's resource-watcher in a follow-up unit.
+pub fn registration_status_from(state: &rustpush::ResourceState) -> RegistrationStatus {
+    match state {
+        rustpush::ResourceState::Generated => RegistrationStatus::Registered,
+        rustpush::ResourceState::Generating => RegistrationStatus::Registering,
+        rustpush::ResourceState::Failed(failure) => {
+            let error = failure.error.to_string();
+            match failure.retry_wait {
+                Some(retry_in_s) => RegistrationStatus::TransientFailure {
+                    retry_in_s,
+                    error,
+                },
+                None => RegistrationStatus::LoggedOut { error },
+            }
+        }
+        rustpush::ResourceState::Closed => {
+            RegistrationStatus::LoggedOut {
+                error: "connection closed".into(),
+            }
+        }
+    }
+}
+
 /// Returned by `subscribe` when the underlying connection is dead and
 /// cannot be subscribed to. The receive loop calls `reconnect` to
 /// re-establish the connection, then retries `subscribe`.
@@ -301,45 +338,55 @@ pub struct ConnectionDead;
 #[allow(dead_code)]
 pub struct ReconnectError(pub String);
 
-/// Subscribe with up to 3 attempts, calling `reconnect` between attempts.
-/// Returns `Some(rx)` on success, `None` after giving up.
+/// Subscribe with infinite retries and exponential backoff.
+///
+/// Retries forever — never returns until subscribe succeeds. Exponential
+/// backoff between attempts starts at 1s, doubles per consecutive failure,
+/// and is capped at 60s. A `kick.notify_one()` short-circuits the backoff
+/// to trigger an immediate retry. A failing `reconnect` is logged and the
+/// loop continues (it never aborts).
 async fn subscribe_with_reconnect<S, R, RFut>(
     subscribe: &S,
     reconnect: &R,
-) -> Option<tokio::sync::broadcast::Receiver<APSMessage>>
+    kick: std::sync::Arc<tokio::sync::Notify>,
+) -> tokio::sync::broadcast::Receiver<APSMessage>
 where
     S: Fn() -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead>,
     R: Fn() -> RFut,
     RFut: std::future::Future<Output = Result<(), ReconnectError>>,
 {
-    for attempt in 0..3 {
+    let one_sec = std::time::Duration::from_secs(1);
+    let max_backoff = std::time::Duration::from_secs(60);
+    let mut backoff = one_sec;
+    loop {
         match subscribe() {
-            Ok(rx) => return Some(rx),
+            Ok(rx) => return rx,
             Err(ConnectionDead) => {
-                log::warn!(
-                    "connection dead, attempting reconnect (attempt {})",
-                    attempt + 1
-                );
+                log::warn!("connection dead, attempting reconnect");
                 if let Err(e) = reconnect().await {
                     log::error!("reconnect failed: {e:?}");
-                    return None;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
+                    }
+                    _ = kick.notified() => {
+                        // Kick short-circuits — no backoff change.
+                    }
+                }
             }
         }
     }
-    log::error!(
-        "connection still dead after 3 reconnect attempts, exiting receive loop"
-    );
-    None
 }
 
 /// Long-running receive loop. Calls `subscribe` to obtain a broadcast
 /// receiver of inbound APS messages and processes each one via `process`.
 /// On `Lagged` the dropped count is logged and the loop continues; on
-/// `Closed` the loop tries to re-subscribe (with reconnect-on-dead logic);
-/// on `kick.notified()` the loop re-subscribes. The `reconnect` closure is
-/// called when `subscribe` returns `Err(ConnectionDead)`.
+/// `Closed` the loop re-subscribes (with infinite retry via
+/// [`subscribe_with_reconnect`]); on `kick.notified()` the loop
+/// re-subscribes. The `reconnect` closure is called when `subscribe`
+/// returns `Err(ConnectionDead)`. The loop never exits — it retries
+/// subscribe indefinitely until it succeeds.
 /// Extracted from `start_receiving` so the loop structure (subscribe +
 /// recv + error arms + reconnect) can be tested without a live APNs connection.
 async fn run_receive_loop<S, P, R, SFut, RFut>(
@@ -355,9 +402,7 @@ where
     R: Fn() -> RFut + Send,
     RFut: std::future::Future<Output = Result<(), ReconnectError>> + Send,
 {
-    let Some(mut rx) = subscribe_with_reconnect(&subscribe, &reconnect).await else {
-        return;
-    };
+    let mut rx = subscribe_with_reconnect(&subscribe, &reconnect, std::sync::Arc::clone(&kick)).await;
     log::info!("receive loop started");
     loop {
         tokio::select! {
@@ -368,18 +413,12 @@ where
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     log::warn!("receive channel closed, re-subscribing");
-                    let Some(new_rx) = subscribe_with_reconnect(&subscribe, &reconnect).await else {
-                        return;
-                    };
-                    rx = new_rx;
+                    rx = subscribe_with_reconnect(&subscribe, &reconnect, std::sync::Arc::clone(&kick)).await;
                 }
             },
             _ = kick.notified() => {
                 log::info!("kick received, re-subscribing");
-                let Some(new_rx) = subscribe_with_reconnect(&subscribe, &reconnect).await else {
-                    return;
-                };
-                rx = new_rx;
+                rx = subscribe_with_reconnect(&subscribe, &reconnect, std::sync::Arc::clone(&kick)).await;
             }
         }
     }
@@ -686,6 +725,8 @@ impl Backend for RustpushBackend {
     ) -> std::sync::Arc<tokio::sync::Notify> {
         let conn = conn(connection).conn.clone();
         let imclient = client(c).clone();
+        let imclient_for_watch = imclient.clone(); // retained for the resource-state watcher
+        let notify_for_watch = notify.clone(); // retained for the resource-state watcher
         let kick = std::sync::Arc::new(tokio::sync::Notify::new());
         let kick_spawn = std::sync::Arc::clone(&kick);
         crate::runtime::runtime().spawn(async move {
@@ -696,7 +737,7 @@ impl Backend for RustpushBackend {
             let subscribe = {
                 let state = std::sync::Arc::clone(&state);
                 move || -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead> {
-                    let conn = state.lock().expect("connection mutex poisoned").clone();
+                    let conn = state.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     Ok(api::subscribe_conn(&conn))
                 }
             };
@@ -706,7 +747,7 @@ impl Backend for RustpushBackend {
                 move || {
                     let state = std::sync::Arc::clone(&state);
                     async move {
-                        let conn = state.lock().expect("connection mutex poisoned").clone();
+                        let conn = state.lock().unwrap_or_else(|p| p.into_inner()).clone();
                         conn.inner().refresh_now().await
                             .map_err(|e| ReconnectError(format!("refresh failed: {e}")))?;
                         log::info!("connection re-established via refresh");
@@ -724,7 +765,7 @@ impl Backend for RustpushBackend {
                     let notify = notify.clone();
                     let state = std::sync::Arc::clone(&state);
                     async move {
-                        let conn = state.lock().expect("connection mutex poisoned").clone();
+                        let conn = state.lock().unwrap_or_else(|p| p.into_inner()).clone();
                         match imclient.handle(msg).await {
                             Ok(Some(inst)) => {
                                 log_inst(&inst);
@@ -838,6 +879,31 @@ impl Backend for RustpushBackend {
             )
             .await
         });
+
+        // Spawn the identity resource state watcher. Subscribes to the resource
+        // manager's watch channel, sends one initial event, then forwards every
+        // change to the UI via `notify`. Exits when the watch channel closes
+        // (resource manager dropped).
+        crate::runtime::runtime().spawn(async move {
+            let mut rx = imclient_for_watch.identity.resource_state.subscribe();
+            // Send initial state immediately so the UI reflects reality at startup.
+            // Clone the value to drop the borrow before the await (the Ref is
+            // not Send and cannot cross the await boundary).
+            let initial = rx.borrow_and_update().clone();
+            let _ = notify_for_watch
+                .send(RecvEvent::Registration(registration_status_from(&initial)))
+                .await;
+            loop {
+                if rx.changed().await.is_err() {
+                    // The resource watch channel was closed — resource is gone.
+                    break;
+                }
+                let s = rx.borrow_and_update().clone();
+                let _ = notify_for_watch
+                    .send(RecvEvent::Registration(registration_status_from(&s)))
+                    .await;
+            }
+        });
         kick
     }
 
@@ -950,7 +1016,54 @@ impl Backend for RustpushBackend {
             Err(e) => Err(e),
         };
 
-        send_result?;
+        let mut job = send_result?;
+
+        // Drain the delivery-result broadcast channel to collect per-target
+        // outcomes.  The channel closes when the InnerSendJob task finishes
+        // (drops its sender, which also means the JoinHandle is ready).
+        let mut delivery_results: Vec<SendResult> = Vec::new();
+        loop {
+            match job.process.recv().await {
+                Ok((_handle, result)) => delivery_results.push(result),
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("send delivery channel lagged by {n} messages");
+                    continue;
+                }
+            }
+        }
+
+        // Await the background handle to catch JoinError / PushError.
+        if let Some(handle) = job.handle {
+            handle
+                .await
+                .map_err(|e| anyhow::anyhow!("send delivery task panicked: {e}"))?
+                .map_err(|e| anyhow::anyhow!("send delivery failed: {e}"))?;
+        }
+
+        // Map delivery outcomes.
+        // - At least one Sent → success (partial per-device failures OK).
+        // - No results at all (relay/no_response, empty targets) → success.
+        // - All TimedOut → timeout error (catches categorize_send_error's
+        //   io::ErrorKind::TimedOut sniff).
+        // - All APSError or mixed failures → generic send error.
+        if !delivery_results.iter().any(|r| matches!(r, SendResult::Sent))
+            && !delivery_results.is_empty()
+        {
+            let all_timed_out = delivery_results
+                .iter()
+                .all(|r| matches!(r, SendResult::TimedOut));
+            if all_timed_out {
+                return Err(anyhow::anyhow!(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "message delivery timed out for all targets",
+                )));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "message delivery failed (APNS errors for all targets)"
+                ));
+            }
+        }
 
         Ok(IncomingMessage {
             guid,
@@ -1054,10 +1167,46 @@ impl Backend for RustpushBackend {
         let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
         inst.id = guid.clone();
         let date = now_ms();
-        imclient
+        let mut job = imclient
             .send(&mut inst)
             .await
             .map_err(|e| anyhow::anyhow!("send failed: {e:?}"))?;
+
+        // Drain delivery results (same policy as send_text).
+        let mut delivery_results: Vec<SendResult> = Vec::new();
+        loop {
+            match job.process.recv().await {
+                Ok((_handle, result)) => delivery_results.push(result),
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("send attachment delivery channel lagged by {n} messages");
+                    continue;
+                }
+            }
+        }
+        if let Some(handle) = job.handle {
+            handle
+                .await
+                .map_err(|e| anyhow::anyhow!("send delivery task panicked: {e}"))?
+                .map_err(|e| anyhow::anyhow!("send delivery failed: {e}"))?;
+        }
+        if !delivery_results.iter().any(|r| matches!(r, SendResult::Sent))
+            && !delivery_results.is_empty()
+        {
+            let all_timed_out = delivery_results
+                .iter()
+                .all(|r| matches!(r, SendResult::TimedOut));
+            if all_timed_out {
+                return Err(anyhow::anyhow!(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "attachment delivery timed out for all targets",
+                )));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "attachment delivery failed (APNS errors for all targets)"
+                ));
+            }
+        }
 
         // Cache a local copy so the UI can render the sent image right away.
         let local_path = cache_copy(&path, &guid, 0, &name).map(|p| p.to_string_lossy().into_owned());
@@ -1543,6 +1692,7 @@ pub fn ingest_from(inst: &MessageInst, my_handles: &[String]) -> Ingest {
                 reply_part: n.reply_part.clone(),
                 item_type: 0,
                 attachments: Vec::new(),
+                pending: false,
             })
         }
         Message::React(r) => match tapback_type(&r.reaction) {
@@ -2689,7 +2839,7 @@ mod tests {
         handle.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn receive_loop_calls_reconnect_on_dead_connection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -2762,15 +2912,28 @@ mod tests {
             })
         };
 
-        // Give the loop time to call subscribe (gets Err), then reconnect, then
-        // subscribe again (gets Ok), then process the one message.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Let the spawned task run: first subscribe call (gets Err), reconnect,
+        // then the 1s backoff sleep starts.
+        tokio::task::yield_now().await;
 
+        // Reconnect should have been called once before the backoff.
         assert_eq!(
             reconnect_call_count.load(Ordering::SeqCst),
             1,
             "reconnect must be called exactly once, not in a spin loop"
         );
+        assert_eq!(
+            subscribe_call_count.load(Ordering::SeqCst),
+            1,
+            "only the first subscribe call should have run so far"
+        );
+
+        // Advance virtual time past the 1s base backoff to trigger the retry.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Now the retry subscribe should have succeeded and the message processed.
         assert_eq!(
             processed_count.load(Ordering::SeqCst),
             1,
@@ -3051,5 +3214,460 @@ mod tests {
             0,
             "password_prompt closure should NOT be called when clique is set up (SyncNow path)"
         );
+    }
+
+    /// NEW CONTRACT: `subscribe_with_reconnect` never gives up — retries
+    /// indefinitely with exponential backoff.  This test pins that a subscribe
+    /// that fails 10 times (ConnectionDead) before succeeding on the 11th call
+    /// eventually returns a receiver (not None), and that subscribe is called
+    /// exactly 11 times.
+    ///
+    /// The NEW signature adds a `kick: Arc<Notify>` parameter and returns a
+    /// bare `broadcast::Receiver` (non-optional).
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_with_reconnect_never_gives_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+
+        let subscribe_count = Arc::new(AtomicUsize::new(0));
+        // Pre-create a channel whose receiver we return on the 11th call.
+        let (tx, _rx) = broadcast::channel::<APSMessage>(16);
+
+        let subscribe = {
+            let count = Arc::clone(&subscribe_count);
+            move || -> Result<_, ConnectionDead> {
+                let c = count.fetch_add(1, Ordering::SeqCst);
+                if c < 10 {
+                    Err(ConnectionDead)
+                } else {
+                    Ok(tx.subscribe())
+                }
+            }
+        };
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let kick = Arc::new(tokio::sync::Notify::new());
+
+        let handle = tokio::spawn(async move {
+            // NEW 3-parameter signature — will not compile against the old
+            // 2-parameter `subscribe_with_reconnect`.
+            subscribe_with_reconnect(&subscribe, &reconnect, kick).await
+        });
+
+        // Let the first subscribe call happen.
+        tokio::task::yield_now().await;
+
+        // Drive one backoff period at a time through all 10 retries.
+        // Sequence: 1, 2, 4, 8, 16, 32, 60, 60, 60, 60 (seconds).
+        // Each advance fires exactly one pending sleep; after each one the
+        // woken task runs subscribe (fails), reconnect (succeeds), and
+        // registers the next backoff sleep.
+        for &backoff in &[1, 2, 4, 8, 16, 32, 60, 60, 60, 60] {
+            tokio::time::advance(Duration::from_secs(backoff)).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        // The 11th subscribe call should have succeeded — the JoinHandle
+        // resolves immediately.
+        let rx = handle.await.expect("task should complete after 10 failures");
+        drop(rx);
+
+        assert_eq!(
+            subscribe_count.load(Ordering::SeqCst),
+            11,
+            "subscribe must be called 11 times (10 failures + 1 success)"
+        );
+    }
+
+    /// NEW CONTRACT: exponential backoff base ~1s, doubling per consecutive
+    /// failure, capped at 60s.
+    ///
+    /// Pins:
+    ///   (a) the second attempt does NOT happen before ~1s of virtual time
+    ///   (b) after many failures the inter-attempt gap never exceeds 60s
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_with_reconnect_backoff_timing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let subscribe = {
+            let cc = call_count.clone();
+            move || -> Result<_, ConnectionDead> {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Err(ConnectionDead)
+            }
+        };
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let kick = Arc::new(tokio::sync::Notify::new());
+
+        let handle = {
+            let kick = Arc::clone(&kick);
+            tokio::spawn(async move {
+                // This always fails so the future never completes — we abort.
+                let _rx =
+                    subscribe_with_reconnect(&subscribe, &reconnect, kick).await;
+                unreachable!("subscribe always fails")
+            })
+        };
+
+        // ---- (a) second attempt does not happen before ~1s ----
+
+        // First call happens immediately.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "first subscribe call must happen immediately"
+        );
+
+        // After 999ms the second attempt must NOT have happened.
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "second attempt must not happen before ~1s"
+        );
+
+        // After 1ms more (1s total) the second attempt fires.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "second attempt must happen after ~1s"
+        );
+
+        // ---- (b) advance past the doubling phase to reach the 60s cap ----
+        // Backoff sequence from here: 2, 4, 8, 16, 32, 60s.
+        for &backoff in &[2, 4, 8, 16, 32, 60] {
+            tokio::time::advance(Duration::from_secs(backoff)).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+        let prev_count = call_count.load(Ordering::SeqCst);
+        assert!(
+            prev_count >= 7,
+            "must have had at least 7 failures to reach capped state, got {prev_count}"
+        );
+
+        // Backoff is now capped at 60s: advance 59s, no new call.
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            prev_count,
+            "no new attempt with 59s advance (cap = 60s)"
+        );
+
+        // Advance 2s more (61s from last call): cap exceeded, new call.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            call_count.load(Ordering::SeqCst) > prev_count,
+            "new attempt must fire after 61s (exceeds the 60s cap)"
+        );
+
+        handle.abort();
+    }
+
+    /// NEW CONTRACT: a `kick.notify_one()` while the backoff sleep is pending
+    /// causes an immediate retry without waiting out the full backoff.
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_with_reconnect_kick_short_circuit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let subscribe = {
+            let cc = call_count.clone();
+            move || -> Result<_, ConnectionDead> {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Err(ConnectionDead)
+            }
+        };
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let kick = Arc::new(tokio::sync::Notify::new());
+
+        let handle = {
+            let kick = Arc::clone(&kick);
+            tokio::spawn(async move {
+                let _rx =
+                    subscribe_with_reconnect(&subscribe, &reconnect, kick).await;
+                unreachable!("subscribe always fails")
+            })
+        };
+
+        // Let the first subscribe call happen.
+        tokio::task::yield_now().await;
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Advance only 100ms — the 1s backoff has NOT expired yet.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "no retry yet: still inside the 1s backoff"
+        );
+
+        // Fire the kick — should cause an immediate retry without advancing
+        // to the full 1s.
+        kick.notify_one();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "kick must cause an immediate subscribe retry"
+        );
+        // Verify only 100ms of virtual time has passed (not the full 1s backoff).
+        assert!(
+            tokio::time::Instant::now().elapsed() < Duration::from_secs(1),
+            "kick should short-circuit before the backoff expires"
+        );
+
+        handle.abort();
+    }
+
+    /// NEW CONTRACT: a failing `reconnect` (returns `Err(ReconnectError)`)
+    /// must NOT abort — the loop keeps retrying.
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_with_reconnect_reconnect_error_does_not_abort() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+
+        let subscribe_count = Arc::new(AtomicUsize::new(0));
+        let reconnect_count = Arc::new(AtomicUsize::new(0));
+
+        let (tx, _rx) = broadcast::channel::<APSMessage>(16);
+        let conn: Arc<Mutex<Option<broadcast::Sender<APSMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let subscribe = {
+            let sc = subscribe_count.clone();
+            let conn = conn.clone();
+            move || -> Result<_, ConnectionDead> {
+                sc.fetch_add(1, Ordering::SeqCst);
+                let guard = conn.lock().unwrap();
+                match &*guard {
+                    None => Err(ConnectionDead),
+                    Some(sender) => Ok(sender.subscribe()),
+                }
+            }
+        };
+
+        let reconnect = {
+            let rc = reconnect_count.clone();
+            let conn = conn.clone();
+            let tx = tx.clone();
+            move || {
+                let conn = conn.clone();
+                let rc = rc.clone();
+                let tx = tx.clone();
+                async move {
+                    let c = rc.fetch_add(1, Ordering::SeqCst);
+                    // First 2 reconnect attempts fail, 3rd succeeds.
+                    if c < 2 {
+                        Err(ReconnectError("simulated failure".into()))
+                    } else {
+                        *conn.lock().unwrap() = Some(tx);
+                        Ok(())
+                    }
+                }
+            }
+        };
+
+        let kick = Arc::new(tokio::sync::Notify::new());
+
+        let handle = tokio::spawn(async move {
+            subscribe_with_reconnect(&subscribe, &reconnect, kick).await
+        });
+
+        // Let the first subscribe call happen (fails), reconnect(1) fails,
+        // sleep(1s) starts.
+        tokio::task::yield_now().await;
+
+        // Stepwise through each backoff period.
+        // Pipeline:
+        //   subscribe(1) fails, reconnect(1) fails, sleep(1s)
+        // → subscribe(2) fails, reconnect(2) fails, sleep(2s)
+        // → subscribe(3) fails, reconnect(3) succeeds, sleep(4s)
+        // → subscribe(4) succeeds
+        for &backoff in &[1, 2, 4] {
+            tokio::time::advance(Duration::from_secs(backoff)).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        let rx = handle.await
+            .expect("task should complete after reconnect eventually succeeds");
+        drop(rx);
+
+        assert_eq!(
+            reconnect_count.load(Ordering::SeqCst),
+            3,
+            "reconnect must be called 3 times (2 failures + 1 success)"
+        );
+        assert_eq!(
+            subscribe_count.load(Ordering::SeqCst),
+            4,
+            "subscribe must be called 4 times (3 failures + 1 success)"
+        );
+    }
+
+    /// NEW CONTRACT: `run_receive_loop` survives arbitrarily many consecutive
+    /// subscribe failures (>3, the old limit) and processes a message after
+    /// eventual reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn run_receive_loop_survives_consecutive_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+
+        let subscribe_call_count = Arc::new(AtomicUsize::new(0));
+        let processed_count = Arc::new(AtomicUsize::new(0));
+
+        // Pre-create a sender so subscribe can return Ok after 4 failures.
+        let (tx, _rx) = broadcast::channel::<APSMessage>(16);
+
+        let subscribe = {
+            let sc = subscribe_call_count.clone();
+            let tx_clone = tx.clone();
+            move || -> Result<_, ConnectionDead> {
+                let c = sc.fetch_add(1, Ordering::SeqCst);
+                // Fail the first 4 times (>3 old limit), then succeed.
+                if c < 4 {
+                    Err(ConnectionDead)
+                } else {
+                    let rx = tx_clone.subscribe();
+                    tx_clone.send(APSMessage::Ping).unwrap();
+                    Ok(rx)
+                }
+            }
+        };
+
+        let process = {
+            let pc = processed_count.clone();
+            move |_msg: APSMessage| {
+                let p = pc.clone();
+                async move { p.fetch_add(1, Ordering::SeqCst); }
+            }
+        };
+
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let kick = Arc::new(tokio::sync::Notify::new());
+
+        let handle = {
+            let kick = Arc::clone(&kick);
+            tokio::spawn(async move {
+                run_receive_loop(subscribe, process, kick, reconnect).await;
+            })
+        };
+
+        // Let the first subscribe call happen.
+        tokio::task::yield_now().await;
+        assert_eq!(subscribe_call_count.load(Ordering::SeqCst), 1,
+            "first subscribe call must happen immediately");
+
+        // Stepwise through 4 backoff periods: 1, 2, 4, 8s.
+        for &backoff in &[1, 2, 4, 8] {
+            tokio::time::advance(Duration::from_secs(backoff)).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            subscribe_call_count.load(Ordering::SeqCst) >= 5,
+            "subscribe must have been called at least 5 times (4 failures + 1 success)"
+        );
+        assert_eq!(
+            processed_count.load(Ordering::SeqCst),
+            1,
+            "one message must be processed after eventual reconnect"
+        );
+
+        handle.abort();
+    }
+
+    // --- registration_status_from mapping tests ---
+
+    #[test]
+    fn registration_status_maps_generated_to_registered() {
+        let state = rustpush::ResourceState::Generated;
+        assert_eq!(
+            super::registration_status_from(&state),
+            RegistrationStatus::Registered,
+        );
+    }
+
+    #[test]
+    fn registration_status_maps_generating_to_registering() {
+        let state = rustpush::ResourceState::Generating;
+        assert_eq!(
+            super::registration_status_from(&state),
+            RegistrationStatus::Registering,
+        );
+    }
+
+    #[test]
+    fn registration_status_maps_transient_failure() {
+        let failure = rustpush::ResourceFailure {
+            retry_wait: Some(30),
+            error: Arc::new(rustpush::PushError::BadMsg),
+        };
+        let state = rustpush::ResourceState::Failed(failure);
+        let status = super::registration_status_from(&state);
+        match &status {
+            RegistrationStatus::TransientFailure { retry_in_s, error } => {
+                assert_eq!(*retry_in_s, 30);
+                // error string should be PushError::BadMsg rendered via Display
+                assert_eq!(error, &rustpush::PushError::BadMsg.to_string());
+            }
+            other => panic!("expected TransientFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registration_status_maps_permanent_failure() {
+        let failure = rustpush::ResourceFailure {
+            retry_wait: None,
+            error: Arc::new(rustpush::PushError::BadMsg),
+        };
+        let state = rustpush::ResourceState::Failed(failure);
+        let status = super::registration_status_from(&state);
+        match &status {
+            RegistrationStatus::LoggedOut { error } => {
+                assert_eq!(error, &rustpush::PushError::BadMsg.to_string());
+            }
+            other => panic!("expected LoggedOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registration_status_maps_closed_to_logged_out() {
+        let state = rustpush::ResourceState::Closed;
+        let status = super::registration_status_from(&state);
+        match &status {
+            RegistrationStatus::LoggedOut { .. } => {} // any error string is fine
+            other => panic!("expected LoggedOut, got {other:?}"),
+        }
     }
 }

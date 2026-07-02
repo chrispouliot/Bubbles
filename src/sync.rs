@@ -77,6 +77,7 @@ pub fn cloud_message_to_ingest(
             reply_part: None,
             item_type: 0,
             attachments: Vec::new(),
+            pending: false,
         });
     }
 

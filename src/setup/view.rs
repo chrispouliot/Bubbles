@@ -13,6 +13,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 
 use crate::gtk_bridge;
+use crate::power::PowerMonitor;
 use crate::protocol::{Backend, LoginState};
 use crate::setup::{flow, SetupState};
 use crate::store::Store;
@@ -50,6 +51,7 @@ pub fn build_window(
     app: &adw::Application,
     backend: Arc<dyn Backend>,
     store: Store,
+    monitor: Arc<PowerMonitor>,
 ) -> adw::ApplicationWindow {
     let state: Shared = Rc::new(RefCell::new(SetupState::default()));
     state.borrow_mut().store = Some(store);
@@ -74,14 +76,14 @@ pub fn build_window(
                 s.client = Some(restored.client);
                 s.handles = restored.handles.clone();
             }
-            go_messaging(&nav_cb, &state_cb, &backend_cb);
+            go_messaging(&nav_cb, &state_cb, &backend_cb, &monitor);
         }
         Ok(None) => {
-            nav_cb.replace(&[hardware_page(&nav_cb, &state_cb, &backend_cb)]);
+            nav_cb.replace(&[hardware_page(&nav_cb, &state_cb, &backend_cb, &monitor)]);
         }
         Err(e) => {
             eprintln!("session restore failed, onboarding instead: {e:#}");
-            nav_cb.replace(&[hardware_page(&nav_cb, &state_cb, &backend_cb)]);
+            nav_cb.replace(&[hardware_page(&nav_cb, &state_cb, &backend_cb, &monitor)]);
         }
     });
 
@@ -98,7 +100,7 @@ pub fn build_window(
 }
 
 /// Hand off to the messaging UI, pulling the live session out of `state`.
-fn go_messaging(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>) {
+fn go_messaging(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>, monitor: &Arc<PowerMonitor>) {
     let (store, connection, client, handles) = {
         let s = state.borrow();
         (
@@ -108,7 +110,7 @@ fn go_messaging(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Bac
             s.handles.clone(),
         )
     };
-    crate::ui::enter_messaging(nav, backend, store, connection, client, handles);
+    crate::ui::enter_messaging(nav, backend, store, connection, client, handles, monitor);
 }
 /// Brief placeholder shown while [`flow::restore`] checks for a saved session (spinner only, no text)
 /// Brief placeholder shown while [`flow::restore`] checks for a saved session.
@@ -187,6 +189,7 @@ fn finish_hardware(
     backend: &Arc<dyn Backend>,
     errors: &gtk::Label,
     btn: &gtk::Button,
+    monitor: &Arc<PowerMonitor>,
 ) {
     btn.set_sensitive(true);
     match result {
@@ -199,7 +202,7 @@ fn finish_hardware(
                 s.anisette = Some(ready.connected.anisette);
                 s.login_state = LoginState::NeedsLogin;
             }
-            nav.push(&login_page(nav, state, backend, &ready.device));
+            nav.push(&login_page(nav, state, backend, &ready.device, monitor));
         }
         Err(e) => show_error(errors, &e),
     }
@@ -209,6 +212,7 @@ fn hardware_page(
     nav: &adw::NavigationView,
     state: &Shared,
     backend: &Arc<dyn Backend>,
+    monitor: &Arc<PowerMonitor>,
 ) -> adw::NavigationPage {
     let content = column();
 
@@ -245,6 +249,7 @@ fn hardware_page(
         let blob = blob.clone();
         let errors = errors.clone();
         let btn = use_local.clone();
+        let monitor = Arc::clone(monitor);
         use_local.connect_clicked(move |_| {
             let text = blob.text().to_string();
             let trimmed = text.trim();
@@ -279,8 +284,9 @@ fn hardware_page(
             let backend = backend.clone();
             let errors = errors.clone();
             let btn2 = btn.clone();
+            let monitor = monitor.clone();
             gtk_bridge::spawn(fut, move |result| {
-                finish_hardware(result, &nav, &state, &backend, &errors, &btn2);
+                finish_hardware(result, &nav, &state, &backend, &errors, &btn2, &monitor);
             });
         });
     }
@@ -305,6 +311,7 @@ fn hardware_page(
         let code = code.clone();
         let errors = errors.clone();
         let btn = connect.clone();
+        let monitor = Arc::clone(monitor);
         connect.connect_clicked(move |_| {
             let entered = code.text().to_string();
             if entered.is_empty() {
@@ -325,8 +332,9 @@ fn hardware_page(
             let backend = backend.clone();
             let errors = errors.clone();
             let btn2 = btn.clone();
+            let monitor = monitor.clone();
             gtk_bridge::spawn(fut, move |result| {
-                finish_hardware(result, &nav, &state, &backend, &errors, &btn2);
+                finish_hardware(result, &nav, &state, &backend, &errors, &btn2, &monitor);
             });
         });
     }
@@ -341,6 +349,7 @@ fn login_page(
     state: &Shared,
     backend: &Arc<dyn Backend>,
     device: &crate::protocol::DeviceInfo,
+    monitor: &Arc<PowerMonitor>,
 ) -> adw::NavigationPage {
     let content = column();
 
@@ -376,6 +385,7 @@ fn login_page(
         let password = password.clone();
         let errors = errors.clone();
         let sign_in_btn = sign_in.clone();
+        let monitor = Arc::clone(monitor);
         sign_in.connect_clicked(move |_| {
             let id = apple_id.text().to_string();
             let pw = password.text().to_string();
@@ -414,6 +424,7 @@ fn login_page(
             let backend = backend.clone();
             let errors = errors.clone();
             let sign_in_btn = sign_in_btn.clone();
+            let monitor = monitor.clone();
             gtk_bridge::spawn(fut, move |result| {
                 sign_in_btn.set_sensitive(true);
                 match result {
@@ -428,7 +439,7 @@ fn login_page(
                             }
                             s.login_state = adv.state.clone();
                         }
-                        route_after_login(&nav, &state, &backend, &errors);
+                        route_after_login(&nav, &state, &backend, &errors, &monitor);
                     }
                     Err(e) => show_error(&errors, &e),
                 }
@@ -440,20 +451,20 @@ fn login_page(
 }
 
 /// After login resolves: either ask for a 2FA code or go straight to register.
-fn route_after_login(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>, errors: &gtk::Label) {
+fn route_after_login(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>, errors: &gtk::Label, monitor: &Arc<PowerMonitor>) {
     let login_state = state.borrow().login_state.clone();
     match login_state {
         LoginState::Needs2FaVerification | LoginState::NeedsSms2FaVerification(_) => {
-            nav.push(&two_fa_page(nav, state, backend));
+            nav.push(&two_fa_page(nav, state, backend, monitor));
         }
-        LoginState::LoggedIn => do_register(nav, state, backend, errors),
+        LoginState::LoggedIn => do_register(nav, state, backend, errors, monitor),
         other => eprintln!("unexpected post-login state: {other:?}"),
     }
 }
 
 // --- page 3: 2FA code ---
 
-fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>) -> adw::NavigationPage {
+fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>, monitor: &Arc<PowerMonitor>) -> adw::NavigationPage {
     let content = column();
 
     let prompt = gtk::Label::builder()
@@ -481,6 +492,7 @@ fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
         let code = code.clone();
         let errors = errors.clone();
         let verify_btn = verify.clone();
+        let monitor = Arc::clone(monitor);
         verify.connect_clicked(move |_| {
             let entered = code.text().to_string();
             if entered.is_empty() {
@@ -519,6 +531,7 @@ fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
             let backend = backend.clone();
             let errors = errors.clone();
             let verify_btn = verify_btn.clone();
+            let monitor = monitor.clone();
             gtk_bridge::spawn(fut, move |result| {
                 verify_btn.set_sensitive(true);
                 match result {
@@ -531,7 +544,7 @@ fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
                             s.login_state = res.state.clone();
                         }
                         match res.state {
-                            LoginState::LoggedIn => do_register(&nav, &state, &backend, &errors),
+                            LoginState::LoggedIn => do_register(&nav, &state, &backend, &errors, &monitor),
                             _ => errors.set_text("Incorrect code, try again."),
                         }
                         errors.set_visible(!matches!(state.borrow().login_state, LoginState::LoggedIn));
@@ -547,7 +560,7 @@ fn two_fa_page(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
 
 // --- step 4: register, then finalize ---
 
-fn do_register(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>, errors: &gtk::Label) {
+fn do_register(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Backend>, errors: &gtk::Label, monitor: &Arc<PowerMonitor>) {
     let (config, connection, identity, apple_user) = {
         let s = state.borrow();
         (
@@ -564,11 +577,12 @@ fn do_register(nav: &adw::NavigationView, state: &Shared, backend: &Arc<dyn Back
     let state = state.clone();
     let errors = errors.clone();
     let backend = backend.clone();
+    let monitor = Arc::clone(monitor);
     gtk_bridge::spawn(fut, move |result| match result {
         Ok(Ok(registered)) => {
             state.borrow_mut().handles = registered.handles.clone();
             state.borrow_mut().client = Some(registered.client);
-            go_messaging(&nav, &state, &backend);
+            go_messaging(&nav, &state, &backend, &monitor);
         }
         Ok(Err(alert)) => {
             errors.set_text(&format!("{}: {}", alert.title, alert.body));

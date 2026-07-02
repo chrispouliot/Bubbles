@@ -51,7 +51,7 @@ pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
 use util::encode_hex;
 pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure, NSAttributedString, NSString, NSDictionaryTypedCoder, NSNumber, coder_encode_flattened, coder_decode_flattened, StCollapsedValue};
 pub use ids::user::{IDSError, IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
-pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager, KeyCache};
+pub use ids::identity_manager::{SendJob, SendResult, MessageTarget, IdentityManager, KeyCache};
 pub use ids::CertifiedContext;
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
 pub use error::PushError;

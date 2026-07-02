@@ -35,7 +35,10 @@ pub fn handle_prepare_for_sleep(monitor: &PowerMonitor, sleeping: bool) {
 /// subscription alive. Errors (e.g. no system D-Bus in a sandboxed or
 /// headless environment) are logged; the function never panics.
 ///
-/// Not yet wired into the startup path — that is a separate unit.
+/// Spawned once at app scope from `main.rs` (the activation closure, before
+/// `build_window`). The monitor is threaded through to `enter_messaging` where
+/// wake callbacks (receive-loop kick, threshold-gated sync, and APS refresh)
+/// are registered. The D-Bus subscription runs for the lifetime of the process.
 #[cfg(target_os = "linux")]
 pub fn spawn_dbus_power_monitor(monitor: Arc<PowerMonitor>) {
     crate::runtime::runtime().spawn(async move {

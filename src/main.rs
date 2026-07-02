@@ -1,5 +1,6 @@
 mod gtk_bridge;
 mod image;
+mod persist;
 mod power;
 mod protocol;
 mod retry;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 
+use power::PowerMonitor;
 use protocol::Backend;
 
 const APP_ID: &str = "io.github.chrispouliot.Bubbles";
@@ -60,10 +62,17 @@ fn main() -> glib::ExitCode {
             existing.present();
             return;
         }
+        // App-scoped PowerMonitor: created once so D-Bus logind subscription
+        // lives for the process lifetime, not per-view. Threaded through to
+        // enter_messaging for wake callbacks (sync, APS refresh, re-subscribe).
+        let monitor = Arc::new(PowerMonitor::new());
+        #[cfg(target_os = "linux")]
+        crate::power::spawn_dbus_power_monitor(Arc::clone(&monitor));
+
         let window = if std::env::var_os("BUBBLES_DEMO").is_some() {
-            demo::build_demo_window(app)
+            demo::build_demo_window(app, monitor)
         } else {
-            setup::view::build_window(app, make_backend(), make_store())
+            setup::view::build_window(app, make_backend(), make_store(), monitor)
         };
         window.present();
         tray::install(app, &window);

@@ -41,6 +41,10 @@ type ReactionHandler = dyn Fn(String, usize, String);
 /// opening the editor (Unit 6 wires this up).
 type EditHandler = dyn Fn(String, String);
 
+/// Callback type for the "Retry" menu option on failed own messages: receives
+/// the target message GUID and the text to resend.
+type RetryHandler = dyn Fn(String, String);
+
 /// Callback type for the editor's Save button: receives the target message
 /// GUID and the new text. Unit 6 leaves this as a no-op; Unit 7 wires the
 /// real send.
@@ -400,6 +404,14 @@ struct Ui {
     /// instead of `Noop` or `Rebuild`. Updated after every populate_messages
     /// rebuild and after every in-place text update.
     current_text: Rc<RefCell<std::collections::HashMap<String, String>>>,
+    /// Banner shown at the top of the content pane reflecting the iMessage
+    /// identity registration state (re-registering, transient failure, logged
+    /// out by Apple).
+    reg_banner: adw::Banner,
+    /// Guards repeated LoggedOut desktop notifications: set to true once a
+    /// notification has been sent for the current LoggedOut episode, reset
+    /// back to false when Registered arrives.
+    reg_notified: Rc<Cell<bool>>,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -411,6 +423,7 @@ pub fn enter_messaging(
     connection: Connection,
     client: ImClient,
     handles: Vec<String>,
+    monitor: &Arc<crate::power::PowerMonitor>,
 ) {
     install_css();
 
@@ -600,9 +613,19 @@ pub fn enter_messaging(
     content_stack.add_named(&msg_overlay, Some("chat"));
     content_stack.set_visible_child_name("empty");
 
+    // Registration-status banner sits at the top of the content pane, above
+    // the stack, so it's visible whether a chat is open or not.
+    let reg_banner = adw::Banner::new("");
+    reg_banner.set_revealed(false);
+    let content_body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    content_body.append(&reg_banner);
+    content_body.append(&content_stack);
+
     let content_page = page(
         "Select a chat",
-        &content_stack,
+        &content_body,
         Some(compose_outer.upcast_ref()),
         None,
         Some(rename_button.upcast_ref()),
@@ -665,6 +688,8 @@ pub fn enter_messaging(
         current_chips: Rc::new(RefCell::new(std::collections::HashMap::new())),
         current_reactions: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
         current_text: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        reg_banner: reg_banner.clone(),
+        reg_notified: Rc::new(Cell::new(false)),
     };
 
     // Sync the compose bar visibility with the split view's content panel.
@@ -968,8 +993,7 @@ pub fn enter_messaging(
     let (tx, rx) = async_channel::unbounded::<RecvEvent>();
     let kick = backend.start_receiving(&connection, &client, handles, store.clone(), tx);
     // Wire the wake-from-sleep handler to the receive loop's kick signal.
-    let monitor = std::sync::Arc::new(crate::power::PowerMonitor::new());
-    crate::power::wire_wake_to_receive_loop(&monitor, std::sync::Arc::clone(&kick));
+    crate::power::wire_wake_to_receive_loop(monitor, std::sync::Arc::clone(&kick));
 
     // --- Threshold-gated launch sync ---
     // Run on launch when the gap since `last_alive` exceeds 2 hours.
@@ -1034,9 +1058,24 @@ pub fn enter_messaging(
         });
     }
 
-    // Subscribe to OS resume events (Linux only).
-    #[cfg(target_os = "linux")]
-    crate::power::spawn_dbus_power_monitor(std::sync::Arc::clone(&monitor));
+    // --- Proactive APS refresh on resume ---
+    // After wake, sleep 2s for network re-association, then force a fresh
+    // APS connection so the receive loop can re-subscribe without waiting
+    // for the 60-second keepalive ping.
+    #[cfg(feature = "rustpush")]
+    {
+        let connection = connection.clone();
+        monitor.on_resume(move || {
+            let connection = connection.clone();
+            crate::runtime::runtime().spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                match crate::protocol::rustpush_backend::refresh_aps(&connection).await {
+                    Ok(()) => log::info!("APS connection refreshed on resume"),
+                    Err(e) => log::warn!("APS refresh on resume failed: {e}"),
+                }
+            });
+        });
+    }
 
     // --- Periodic last_alive save ---
     // Write the current timestamp every 5 minutes so the threshold gate
@@ -1058,6 +1097,10 @@ pub fn enter_messaging(
             }
         });
     }
+    // Banner "Sign Out…" button opens the sign-out confirmation dialog.
+    let ui_for_banner = ui.clone();
+    reg_banner.connect_button_clicked(move |_| ui_for_banner.show_preferences());
+
     let ui_refresh = ui.clone();
     gtk_bridge::forward(rx, move |ev| match ev {
         RecvEvent::Applied => ui_refresh.schedule_refresh(),
@@ -1070,6 +1113,54 @@ pub fn enter_messaging(
             typing,
             superseded,
         } => ui_refresh.handle_typing(&chat_key, from.as_deref(), typing, superseded),
+        RecvEvent::Registration(status) => {
+            use crate::protocol::RegistrationStatus;
+            match &status {
+                RegistrationStatus::Registered => {
+                    ui_refresh.reg_banner.set_revealed(false);
+                    // Withdraw the registration notification if one was shown.
+                    if let Some(app) = gtk::gio::Application::default() {
+                        app.withdraw_notification("registration");
+                    }
+                    ui_refresh.reg_notified.set(false);
+                }
+                RegistrationStatus::Registering => {
+                    ui_refresh
+                        .reg_banner
+                        .set_title("Re-registering with iMessage…");
+                    ui_refresh.reg_banner.set_button_label(None::<&str>);
+                    ui_refresh.reg_banner.set_revealed(true);
+                }
+                RegistrationStatus::TransientFailure {
+                    retry_in_s,
+                    error,
+                } => {
+                    ui_refresh.reg_banner.set_title(&format!(
+                        "iMessage registration failed — retrying in {retry_in_s}s"
+                    ));
+                    ui_refresh.reg_banner.set_tooltip_text(Some(error));
+                    ui_refresh.reg_banner.set_button_label(None::<&str>);
+                    ui_refresh.reg_banner.set_revealed(true);
+                }
+                RegistrationStatus::LoggedOut { error } => {
+                    ui_refresh
+                        .reg_banner
+                        .set_title("Logged out by Apple — sign in again");
+                    ui_refresh.reg_banner.set_button_label(Some("Sign Out…"));
+                    ui_refresh.reg_banner.set_tooltip_text(Some(error));
+                    ui_refresh.reg_banner.set_revealed(true);
+                    // Send a desktop notification once. The `reg_notified` guard
+                    // prevents re-sending on every repeated LoggedOut event.
+                    if !ui_refresh.reg_notified.replace(true) {
+                        if let Some(app) = gtk::gio::Application::default() {
+                            let n = gtk::gio::Notification::new("Logged out by Apple");
+                            n.set_body(Some(error));
+                            app.send_notification(Some("registration"), &n);
+                        }
+                    }
+                }
+            }
+        }
     });
 }
 
@@ -1675,6 +1766,8 @@ impl Ui {
         page.add(&display);
 
         // --- Sync ---
+        #[cfg(feature = "rustpush")]
+        {
         let sync_group = adw::PreferencesGroup::builder()
             .title("Sync")
             .description("Sync missed messages from iCloud when the app is closed or the device was off.")
@@ -1825,6 +1918,7 @@ impl Ui {
         }
 
         page.add(&sync_group);
+        }
 
         // --- Account ---
         let account = adw::PreferencesGroup::builder().title("Account").build();
@@ -2685,7 +2779,8 @@ impl Ui {
                 let anchor = first.as_ref().map(|(g, _)| g.as_str());
                 let on_reaction = ui.make_reaction_handler();
                 let on_edit = ui.make_edit_handler();
-                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), on_edit.as_ref(), &reactions);
+                let on_retry = ui.make_retry_handler();
+                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), on_edit.as_ref(), on_retry.as_ref(), &reactions);
                 *ui.current_chips.borrow_mut() = chip_map;
                 *ui.current_reactions.borrow_mut() = reactions.clone();
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
@@ -2819,6 +2914,7 @@ impl Ui {
                     ChatUpdatePlan::Append { new_tail, receipt } => {
                         let on_reaction = ui.make_reaction_handler();
                         let on_edit = ui.make_edit_handler();
+                        let on_retry = ui.make_retry_handler();
                         // Seed the group state from the last previously-rendered
                         // message so the first appended widget gets correct spacing.
                         let prev_msg = prev_guids
@@ -2832,6 +2928,7 @@ impl Ui {
                             &ui.preview_cards,
                             on_reaction.as_ref(),
                             on_edit.as_ref(),
+                            on_retry.as_ref(),
                             &reactions,
                             prev_msg,
                         );
@@ -2939,6 +3036,7 @@ impl Ui {
                         let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
                         let on_reaction = ui.make_reaction_handler();
                         let on_edit = ui.make_edit_handler();
+                        let on_retry = ui.make_retry_handler();
                         let (marker, chip_map) = populate_messages(
                             &ui.msg_container,
                             &msgs,
@@ -2948,6 +3046,7 @@ impl Ui {
                             &ui.preview_cards,
                             on_reaction.as_ref(),
                             on_edit.as_ref(),
+                            on_retry.as_ref(),
                             &reactions,
                         );
                         *ui.current_chips.borrow_mut() = chip_map;
@@ -3077,6 +3176,7 @@ impl Ui {
                 let anchor = ui.unread.borrow().as_ref().map(|(g, _)| g.clone());
                 let on_reaction = ui.make_reaction_handler();
                 let on_edit = ui.make_edit_handler();
+                let on_retry = ui.make_retry_handler();
                 let (widgets, marker, chip_map) = build_message_widgets(
                     &older,
                     is_group,
@@ -3085,6 +3185,7 @@ impl Ui {
                     &ui.preview_cards,
                     on_reaction.as_ref(),
                     on_edit.as_ref(),
+                    on_retry.as_ref(),
                     &reactions,
                     None,
                 );
@@ -3225,6 +3326,7 @@ impl Ui {
                 *ui.page_loading.borrow_mut() = false;
                 let on_reaction = ui.make_reaction_handler();
                 let on_edit = ui.make_edit_handler();
+                let on_retry = ui.make_retry_handler();
                 let (marker, chip_map) = populate_messages(
                     &ui.msg_container,
                     &msgs,
@@ -3234,6 +3336,7 @@ impl Ui {
                     &ui.preview_cards,
                     on_reaction.as_ref(),
                     on_edit.as_ref(),
+                    on_retry.as_ref(),
                     &reactions,
                 );
                 *ui.current_chips.borrow_mut() = chip_map;
@@ -3335,6 +3438,7 @@ impl Ui {
                 text: text_for_msg,
                 service: Some("iMessage".into()),
                 date: now_ms(),
+                pending: true,
                 attachments: vec![AttachmentRecord {
                     guid: Some(format!("{guid}-0")),
                     mime: Some(att.mime.clone()),
@@ -3347,10 +3451,12 @@ impl Ui {
             };
 
             let store = self.store.clone();
+            let store_for_send = store.clone(); // retained for inner callback
             let backend = self.backend.clone();
             let client = self.client.clone();
             let connection = self.connection.clone();
             let ui = self.clone();
+            let guid_inner = guid.clone();
             if !text.is_empty() {
                 entry.set_text("");
             }
@@ -3362,6 +3468,9 @@ impl Ui {
                     }
                     ui.reload_messages(chat_id, is_group);
                     ui.reload_chats(|_| {});
+                    let store_inner = store_for_send.clone();
+                    let ui_inner = ui.clone();
+                    let guid_send = guid_inner.clone();
                     gtk_bridge::spawn(
                         async move {
                             backend
@@ -3374,8 +3483,36 @@ impl Ui {
                             Ok::<(), anyhow::Error>(())
                         },
                         move |res| {
-                            if let Err(e) = res {
-                                eprintln!("attachment send failed: {e:#}");
+                            match res {
+                                Ok(()) => {
+                                    let store = store_inner.clone();
+                                    let ui = ui_inner.clone();
+                                    let guid = guid_send.clone();
+                                    gtk_bridge::spawn(
+                                        async move { store.mark_sent(&guid).await },
+                                        move |_| {
+                                            ui.reload_messages(chat_id, is_group);
+                                            ui.reload_chats(|_| {});
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    let category = crate::protocol::categorize_send_error(&e);
+                                    let store = store_inner.clone();
+                                    let ui = ui_inner.clone();
+                                    let guid = guid_send.clone();
+                                    gtk_bridge::spawn(
+                                        async move {
+                                            store
+                                                .apply(Ingest::SendFailed { guid, category })
+                                                .await
+                                        },
+                                        move |_| {
+                                            ui.reload_messages(chat_id, is_group);
+                                            ui.reload_chats(|_| {});
+                                        },
+                                    );
+                                }
                             }
                         },
                     );
@@ -3415,6 +3552,7 @@ impl Ui {
             text: Some(text.clone()),
             service: Some("iMessage".into()),
             date: now_ms(),
+            pending: true,
             ..Default::default()
         };
 
@@ -3446,25 +3584,39 @@ impl Ui {
                         Ok::<(), anyhow::Error>(())
                     },
                     move |res| {
-                        if let Err(e) = res {
-                            let category = crate::protocol::categorize_send_error(&e);
-                            let store = store_fail.clone();
-                            let ui = ui_fail.clone();
-                            let guid = guid_fail;
-                            gtk_bridge::spawn(
-                                async move {
-                                    store
-                                        .apply(Ingest::SendFailed { guid, category })
-                                        .await
-                                },
-                                move |res2| {
-                                    if let Err(e2) = res2 {
-                                        eprintln!("persist send-failed error: {e2:#}");
-                                    }
-                                    ui.reload_messages(chat_id, is_group);
-                                    ui.reload_chats(|_| {});
-                                },
-                            );
+                        match res {
+                            Ok(()) => {
+                                let store = store_fail.clone();
+                                let ui = ui_fail.clone();
+                                let guid = guid_fail.clone();
+                                gtk_bridge::spawn(
+                                    async move { store.mark_sent(&guid).await },
+                                    move |_| {
+                                        ui.reload_messages(chat_id, is_group);
+                                        ui.reload_chats(|_| {});
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                let category = crate::protocol::categorize_send_error(&e);
+                                let store = store_fail.clone();
+                                let ui = ui_fail.clone();
+                                let guid = guid_fail;
+                                gtk_bridge::spawn(
+                                    async move {
+                                        store
+                                            .apply(Ingest::SendFailed { guid, category })
+                                            .await
+                                    },
+                                    move |res2| {
+                                        if let Err(e2) = res2 {
+                                            eprintln!("persist send-failed error: {e2:#}");
+                                        }
+                                        ui.reload_messages(chat_id, is_group);
+                                        ui.reload_chats(|_| {});
+                                    },
+                                );
+                            }
                         }
                     },
                 );
@@ -3766,6 +3918,93 @@ impl Ui {
 
             popover.set_parent(&ui.content_page);
             popover.popup();
+        }))
+    }
+
+    /// Build a closure suitable as the `on_retry` callback for failed own
+    /// text messages. The handler receives `(guid, text)` from the bubble's
+    /// context menu, clears the error state via `store.mark_retrying`,
+    /// re-invokes `backend.send_text` with the same text and guid, and
+    /// updates the store on success (`mark_sent`) or failure
+    /// (`SendFailed`).
+    fn make_retry_handler(&self) -> Option<Rc<RetryHandler>> {
+        let ui = self.clone();
+        Some(Rc::new(move |guid: String, text: String| {
+            let chat = match ui.open_summary.borrow().clone() {
+                Some(c) => c,
+                None => return,
+            };
+            let my_handle = match self_handle(&chat.participants, &ui.handles) {
+                Some(h) => h,
+                None => return,
+            };
+            let chat_ref = chat_ref_of(&chat);
+            let chat_id = chat.id;
+            let is_group = chat.is_group;
+            let store = ui.store.clone();
+            let backend = ui.backend.clone();
+            let client = ui.client.clone();
+
+            // Step 1: mark the message as retrying (pending=1, error=NULL).
+            let store1 = store.clone();
+            let guid1 = guid.clone();
+            let ui_step1 = ui.clone();
+            gtk_bridge::spawn(
+                async move { store1.mark_retrying(&guid1).await },
+                move |_| {
+                    ui_step1.reload_messages(chat_id, is_group);
+                    ui_step1.reload_chats(|_| {});
+                    // Step 2: re-invoke the backend send with the same text & guid.
+                    let store2 = store.clone();
+                    let guid2 = guid.clone();
+                    let ui_step2 = ui_step1.clone();
+                    gtk_bridge::spawn(
+                        async move {
+                            backend
+                                .send_text(&client, &chat_ref, &my_handle, text, guid2)
+                                .await?;
+                            Ok::<(), anyhow::Error>(())
+                        },
+                        move |res| {
+                            match res {
+                                Ok(()) => {
+                                    let store3 = store2.clone();
+                                    let guid3 = guid.clone();
+                                    let ui_step3 = ui_step2.clone();
+                                    gtk_bridge::spawn(
+                                        async move { store3.mark_sent(&guid3).await },
+                                        move |_| {
+                                            ui_step3.reload_messages(chat_id, is_group);
+                                            ui_step3.reload_chats(|_| {});
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    let category =
+                                        crate::protocol::categorize_send_error(&e);
+                                    let store3 = store2.clone();
+                                    let guid3 = guid.clone();
+                                    let ui_step3 = ui_step2.clone();
+                                    gtk_bridge::spawn(
+                                        async move {
+                                            store3
+                                                .apply(Ingest::SendFailed {
+                                                    guid: guid3,
+                                                    category,
+                                                })
+                                                .await
+                                        },
+                                        move |_| {
+                                            ui_step3.reload_messages(chat_id, is_group);
+                                            ui_step3.reload_chats(|_| {});
+                                        },
+                                    );
+                                }
+                            }
+                        },
+                    );
+                },
+            );
         }))
     }
 
@@ -4097,6 +4336,7 @@ fn build_message_widgets(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
     on_edit: Option<&Rc<EditHandler>>,
+    on_retry: Option<&Rc<RetryHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
     prev: Option<&StoredMessage>,
 ) -> (Vec<gtk::Widget>, Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
@@ -4139,7 +4379,7 @@ fn build_message_widgets(
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
         let ctx = MessageContext { m, show_header, top, previews, preview_cards };
-        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, chip.as_ref());
+        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, on_retry, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
             None => row.clone(),
@@ -4233,6 +4473,7 @@ fn populate_messages(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     on_reaction: Option<&Rc<ReactionHandler>>,
     on_edit: Option<&Rc<EditHandler>>,
+    on_retry: Option<&Rc<RetryHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
 ) -> (Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     clear_box(container);
@@ -4293,7 +4534,7 @@ fn populate_messages(
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
         let ctx = MessageContext { m, show_header, top, previews, preview_cards };
-        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, chip.as_ref());
+        let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, on_retry, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
             None => row.clone(),
@@ -4369,14 +4610,142 @@ fn populate_chips_row(row: &gtk::Box, chips: &[LiveReactionSummary]) {
     }
 }
 
-/// "Read 16:06" if read, else "Delivered" if delivered, else nothing.
+/// "Read 16:06" if read, "Delivered" if delivered, "Sending…" if pending
+/// (no error), else nothing.
 fn receipt_status(m: &StoredMessage) -> Option<String> {
     if let Some(d) = m.date_read {
         Some(format!("Read {}", fmt_time(d)))
     } else if m.date_delivered.is_some() {
         Some("Delivered".to_string())
+    } else if m.pending && m.send_error.is_none() {
+        Some("Sending…".to_string())
     } else {
         None
+    }
+}
+
+// Tests for receipt_status and compute_receipt_state.  The helpers below
+// mirror the subset of fields that influence receipt logic so tests stay
+// compact and survive unrelated struct changes.
+#[cfg(test)]
+mod receipt_status_tests {
+    use super::*;
+    use crate::store::SendErrorCategory;
+
+    fn r(
+        guid: &str,
+        is_from_me: bool,
+        pending: bool,
+        date_delivered: Option<i64>,
+        date_read: Option<i64>,
+        send_error: Option<SendErrorCategory>,
+    ) -> StoredMessage {
+        StoredMessage {
+            id: 0,
+            guid: guid.to_string(),
+            chat_id: 0,
+            sender: None,
+            is_from_me,
+            text: None,
+            subject: None,
+            service: None,
+            date: 0,
+            date_delivered,
+            date_read,
+            effect: None,
+            reply_to_guid: None,
+            reply_part: None,
+            associated_guid: None,
+            associated_type: None,
+            item_type: 0,
+            send_error,
+            pending,
+            attachments: vec![],
+        }
+    }
+
+    // ── receipt_status ───────────────────────────────────────────────
+
+    #[test]
+    fn sending_receipt_pending_without_receipt() {
+        let m = r("guid", true, true, None, None, None);
+        assert_eq!(receipt_status(&m), Some("Sending…".to_string()));
+    }
+
+    #[test]
+    fn sending_receipt_date_read_beats_pending() {
+        let m = r("guid", true, true, None, Some(1000), None);
+        let got = receipt_status(&m);
+        assert!(got.is_some(), "expected Some for pending+read, got None");
+        let text = got.unwrap();
+        assert!(
+            text.starts_with("Read "),
+            "expected 'Read …', got {text:?}"
+        );
+    }
+
+    #[test]
+    fn sending_receipt_date_delivered_beats_pending() {
+        let m = r("guid", true, true, Some(2000), None, None);
+        assert_eq!(receipt_status(&m), Some("Delivered".to_string()));
+    }
+
+    #[test]
+    fn sending_receipt_send_error_does_not_produce_sending() {
+        // pending + error → no dates → None (error indicator covers it).
+        let m = r("guid", true, true, None, None, Some(SendErrorCategory::Timeout));
+        assert_eq!(receipt_status(&m), None);
+    }
+
+    #[test]
+    fn sending_receipt_send_error_with_delivered() {
+        // pending + error + delivered → "Delivered" (dates still win).
+        let m = r("guid", true, true, Some(2000), None, Some(SendErrorCategory::Timeout));
+        assert_eq!(receipt_status(&m), Some("Delivered".to_string()));
+    }
+
+    // ── compute_receipt_state ────────────────────────────────────────
+
+    #[test]
+    fn sending_receipt_compute_last_pending_at_end() {
+        // Last own message is pending, no error, no receipts → "Sending…".
+        let msgs = vec![
+            r("A", false, false, None, None, None), // incoming
+            r("B", true,  true,  None, None, None), // own pending (last)
+        ];
+        assert_eq!(compute_receipt_state(&msgs), Some("Sending…".to_string()));
+    }
+
+    #[test]
+    fn sending_receipt_compute_last_pending_not_at_end() {
+        // Pending own message, not the very last message → still "Sending…".
+        let msgs = vec![
+            r("A", false, false, None, None, None), // incoming
+            r("B", true,  true,  None, None, None), // own pending
+            r("C", false, false, None, None, None), // incoming after
+        ];
+        assert_eq!(compute_receipt_state(&msgs), Some("Sending…".to_string()));
+    }
+
+    #[test]
+    fn sending_receipt_compute_non_pending_placeholder_at_end() {
+        // Non-pending, no receipts, at end → zero-width placeholder.
+        let msgs = vec![
+            r("A", false, false, None, None, None),
+            r("B", true,  false, None, None, None),
+        ];
+        assert_eq!(compute_receipt_state(&msgs), Some("\u{200b}".to_string()));
+    }
+
+    #[test]
+    fn sending_receipt_compute_non_pending_placeholder_absent_when_not_last() {
+        // Non-pending, no receipts, not at end → None.
+        let msgs = vec![
+            r("A", false, false, None, None, None),
+            r("B", true,  false, None, None, None),
+            r("C", false, false, None, None, None),
+        ];
+        assert_eq!(compute_receipt_state(&msgs), None);
     }
 }
 
@@ -4920,10 +5289,11 @@ fn message_widget(
     is_group: bool,
     on_reaction: Option<&Rc<ReactionHandler>>,
     on_edit: Option<&Rc<EditHandler>>,
+    on_retry: Option<&Rc<RetryHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     if ctx.m.is_from_me {
-        own_message(ctx, on_edit, chip)
+        own_message(ctx, on_edit, on_retry, chip)
     } else {
         incoming_message(ctx, is_group, on_reaction, chip)
     }
@@ -5042,6 +5412,7 @@ fn incoming_message(
         preview_cards,
         show_picker.as_ref(),
         None,
+        None,
         chip,
     );
     line.append(&body_col);
@@ -5060,6 +5431,7 @@ fn incoming_message(
 fn own_message(
     ctx: MessageContext<'_>,
     on_edit: Option<&Rc<EditHandler>>,
+    on_retry: Option<&Rc<RetryHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     let MessageContext { m, show_header, top, previews, preview_cards } = ctx;
@@ -5109,7 +5481,21 @@ fn own_message(
         None
     };
 
-    let (body_col, bubble_or_overlay) = message_body(m, true, previews, preview_cards, None, show_edit.as_ref(), chip);
+    // Build the optional Retry menu closure for failed own text messages.
+    // Attachment retry is omitted — wiring the stored attachment back
+    // through send_attachment is deferred to a follow-up unit.
+    let show_retry: Option<Rc<dyn Fn()>> = if m.send_error.is_some() && is_text_only {
+        on_retry.map(|cb| -> Rc<dyn Fn()> {
+            let cb = cb.clone();
+            let target_guid = m.guid.clone();
+            let target_text = m.text.clone().unwrap_or_default();
+            Rc::new(move || cb(target_guid.clone(), target_text.clone()))
+        })
+    } else {
+        None
+    };
+
+    let (body_col, bubble_or_overlay) = message_body(m, true, previews, preview_cards, None, show_edit.as_ref(), show_retry.as_ref(), chip);
     line.append(&body_col);
 
     row.append(&line);
@@ -5126,6 +5512,7 @@ fn own_message(
 /// Returns `(col_widget, bubble_or_overlay)` where the second element is `Some`
 /// if a text bubble (with or without chip overlay) was created, `None` for
 /// attachment-only messages with no text.
+#[allow(clippy::too_many_arguments)]
 fn message_body(
     m: &StoredMessage,
     own: bool,
@@ -5133,6 +5520,7 @@ fn message_body(
     preview_cards: &Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
     show_picker: Option<&Rc<dyn Fn()>>,
     show_edit: Option<&Rc<dyn Fn()>>,
+    show_retry: Option<&Rc<dyn Fn()>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     let col = gtk::Box::builder()
@@ -5170,13 +5558,13 @@ fn message_body(
     let is_tapback = m.associated_guid.is_some();
     let bubble_or_overlay: Option<gtk::Widget> = if has_text || is_tapback {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label(&body_text(m), show_picker, show_edit));
+        bubble.append(&bubble_label(&body_text(m), show_picker, show_edit, show_retry));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
     } else if m.attachments.is_empty() {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label("(no text)", show_picker, show_edit));
+        bubble.append(&bubble_label("(no text)", show_picker, show_edit, show_retry));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
@@ -6038,7 +6426,12 @@ fn bubble_box(own: bool) -> gtk::Box {
 
 /// The wrapped, width-capped, left-justified text inside a bubble.
 /// URLs in the text are rendered as clickable links that open in the system browser.
-fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>, show_edit: Option<&Rc<dyn Fn()>>) -> gtk::Label {
+fn bubble_label(
+    text: &str,
+    show_picker: Option<&Rc<dyn Fn()>>,
+    show_edit: Option<&Rc<dyn Fn()>>,
+    show_retry: Option<&Rc<dyn Fn()>>,
+) -> gtk::Label {
     let markup = text_to_markup(text);
     let label = gtk::Label::builder()
         .label(&markup)
@@ -6057,8 +6450,9 @@ fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>, show_edit: Optio
     // so clicking into this label drops the previous one's highlight + cursor.
     register_selectable_label(&label);
 
-    // Append "Reaction" and/or "Edit" items to the label's built-in context
-    // menu (Copy / Select All / …) when the corresponding callbacks are wired.
+    // Append "Reaction", "Edit", and/or "Retry" items to the label's built-in
+    // context menu (Copy / Select All / …) when the corresponding callbacks
+    // are wired.
     let menu = gtk::gio::Menu::new();
     let mut has_any = false;
 
@@ -6081,6 +6475,17 @@ fn bubble_label(text: &str, show_picker: Option<&Rc<dyn Fn()>>, show_edit: Optio
         action_group.add_action(&trigger_action);
         label.insert_action_group("edit", Some(&action_group));
         menu.append(Some("Edit"), Some("edit.trigger"));
+        has_any = true;
+    }
+
+    if let Some(retry) = show_retry {
+        let action_group = gtk::gio::SimpleActionGroup::new();
+        let trigger_action = gtk::gio::SimpleAction::new("trigger", None);
+        let retry = Rc::clone(retry);
+        trigger_action.connect_activate(move |_, _| retry());
+        action_group.add_action(&trigger_action);
+        label.insert_action_group("retry", Some(&action_group));
+        menu.append(Some("Retry"), Some("retry.trigger"));
         has_any = true;
     }
 
@@ -6383,6 +6788,7 @@ fn new_chat_payload(
         reply_part: None,
         item_type: 0,
         attachments: Vec::new(),
+        pending: false,
     };
 
     Some((msg.chat.clone(), msg))
@@ -7053,6 +7459,7 @@ mod extract_target_text_tests {
             associated_type: None,
             item_type: 0,
             send_error: None,
+            pending: false,
             attachments,
         }
     }
@@ -7313,6 +7720,7 @@ mod plan_chat_update_tests {
             associated_type: None,
             item_type: 0,
             send_error: None,
+            pending: false,
             attachments: vec![],
         }
     }
@@ -7777,6 +8185,21 @@ mod plan_chat_update_tests {
         assert_append_keep(
             plan_chat_update(&prev, None, &prev_r, &no_text(), &new, &new_r),
             &["B"],
+        );
+    }
+
+    #[test]
+    fn sending_receipt_plan_transition_sending_to_delivered() {
+        // Same guids; previous receipt was "Sending…", new state has the last
+        // own message delivered → UpdateReceipt("Delivered").
+        let prev = guids(&["A", "B"]);
+        let new = vec![
+            m("A", false, 1000),
+            delivered(m("B", true, 2000), 3000),
+        ];
+        assert_update_receipt(
+            plan_chat_update(&prev, Some("Sending…"), &no_reactions(), &no_text(), &new, &no_reactions()),
+            "Delivered",
         );
     }
 } // mod plan_chat_update_tests

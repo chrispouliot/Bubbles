@@ -157,6 +157,30 @@ pub enum LoginState {
 ///
 /// Methods take `&Handle` and return owned handles; callers clone the cheap
 /// `Arc`-backed handles before moving them onto the tokio runtime.
+/// Registration status for the iMessage identity resource, reported by the
+/// receive loop when the underlying IDS cert/key state changes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RegistrationStatus {
+    /// The identity resource is healthy and registered.
+    Registered,
+    /// A fresh registration is in progress.
+    Registering,
+    /// A transient failure — the resource will retry in `retry_in_s` seconds.
+    TransientFailure {
+        /// Seconds until the next retry attempt.
+        retry_in_s: u64,
+        /// Human-readable error description.
+        error: String,
+    },
+    /// A permanent failure: the user has been logged out by Apple (token
+    /// revoked, account disabled, etc.). The UI should surface this and offer
+    /// to re-onboard.
+    LoggedOut {
+        /// Human-readable error description.
+        error: String,
+    },
+}
+
 /// What the receive loop pulses to the UI. Stored events collapse to `Applied`
 /// (the UI re-queries); typing is ephemeral and carried inline.
 #[derive(Clone, Debug)]
@@ -181,6 +205,9 @@ pub enum RecvEvent {
         /// remove-then-add bounce) and animate the new bubble in.
         superseded: bool,
     },
+    /// The identity resource registration state changed. Carried inline so the
+    /// UI can update the registration badge / banner without a full re-query.
+    Registration(RegistrationStatus),
 }
 
 #[async_trait]
@@ -509,6 +536,62 @@ pub async fn decide_clique_setup_action(backend: &dyn Backend) -> CliqueSetupAct
         CliqueSetupAction::SyncNow
     } else {
         CliqueSetupAction::PromptForPassword
+    }
+}
+
+#[cfg(test)]
+mod registration_status_tests {
+    use super::*;
+
+    #[test]
+    fn registration_status_enum_derives_and_variants() {
+        // Pin: RegistrationStatus exists with Clone + Debug + PartialEq,
+        // and all four variants can be constructed.
+        //
+        // registered / healthy
+        let _registered = RegistrationStatus::Registered;
+        // re-registering in progress
+        let _registering = RegistrationStatus::Registering;
+        // transient failure
+        let _transient = RegistrationStatus::TransientFailure {
+            retry_in_s: 42,
+            error: "timeout".into(),
+        };
+        // permanent failure (logged out by Apple)
+        let _logged_out = RegistrationStatus::LoggedOut {
+            error: "token revoked".into(),
+        };
+
+        // Pin Clone
+        let cloned = RegistrationStatus::Registered.clone();
+        assert_eq!(cloned, RegistrationStatus::Registered);
+
+        // Pin PartialEq: different variants are unequal
+        assert_ne!(
+            RegistrationStatus::Registering,
+            RegistrationStatus::Registered,
+        );
+
+        // Pin Debug via format!
+        let debug_str = format!(
+            "{:?}",
+            RegistrationStatus::TransientFailure {
+                retry_in_s: 10,
+                error: "err".into(),
+            }
+        );
+        assert!(!debug_str.is_empty(), "Debug output should not be empty");
+    }
+
+    #[test]
+    fn registration_status_recv_event_variant() {
+        // Pin: RecvEvent::Registration(RegistrationStatus) exists.
+        let status = RegistrationStatus::Registered;
+        let event = RecvEvent::Registration(status.clone());
+        match &event {
+            RecvEvent::Registration(s) => assert_eq!(*s, status),
+            other => panic!("expected Registration variant, got {other:?}"),
+        }
     }
 }
 

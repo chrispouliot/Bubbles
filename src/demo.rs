@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use crate::power::PowerMonitor;
 use crate::protocol::stub::StubBackend;
 use crate::protocol::{Backend, Connection, ImClient};
 use crate::runtime;
@@ -25,7 +26,7 @@ const NEWS: &str = "mailto:News Bot";
 const STEP: i64 = 60_000;
 
 /// Build a window that drops straight into a seeded, offline messaging UI.
-pub fn build_demo_window(app: &adw::Application) -> adw::ApplicationWindow {
+pub fn build_demo_window(app: &adw::Application, _monitor: Arc<PowerMonitor>) -> adw::ApplicationWindow {
     let store = runtime::runtime().block_on(async {
         let store = Store::open_in_memory()
             .await
@@ -40,7 +41,7 @@ pub fn build_demo_window(app: &adw::Application) -> adw::ApplicationWindow {
     let handles = vec![ME.to_string()];
 
     let nav = adw::NavigationView::new();
-    crate::ui::enter_messaging(&nav, &backend, store, connection, client, handles);
+    crate::ui::enter_messaging(&nav, &backend, store, connection, client, handles, &_monitor);
 
     adw::ApplicationWindow::builder()
         .application(app)

@@ -91,7 +91,14 @@ pub fn do_first_time_init(path: String) {
     init_keystore(SoftwareKeystore {
         state: plist::from_file(&keystore_path).unwrap_or_default(),
         update_state: Box::new(move |state| {
-            plist::to_file_xml(&keystore_path, state).unwrap();
+            match plist_to_buf(state) {
+                Ok(buf) => {
+                    if let Err(e) = crate::persist::write_atomic(&keystore_path, &buf) {
+                        error!("failed to persist keystore.plist: {e}");
+                    }
+                }
+                Err(e) => error!("failed to serialize keystore.plist: {e}"),
+            }
         }),
         encryptor: SoftwareEncryptor(*b"desktopisinsecureyoushouldn'tber"),
     });
@@ -352,7 +359,14 @@ pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, stat
             os_config: config.clone(),
             identity: saved_identity.clone(),
         };
-        std::fs::write(&state_path, plist_to_string(&state).unwrap()).unwrap();
+        match plist_to_buf(&state) {
+            Ok(buf) => {
+                if let Err(e) = crate::persist::write_atomic(&state_path, &buf) {
+                    error!("failed to persist initial hw_info.plist: {e}");
+                }
+            }
+            Err(e) => error!("failed to serialize initial hw_info.plist: {e}"),
+        }
     }
 
     let mut to_refresh = buffered.inner().generated_signal.subscribe();
@@ -369,7 +383,14 @@ pub async fn setup_push(config: &JoinedOSConfig, identity: &IDSNGMIdentity, stat
                         os_config: config_ref.clone(),
                         identity: saved_identity.clone(),
                     };
-                    std::fs::write(&state_path, plist_to_string(&state).unwrap()).unwrap();
+                    match plist_to_buf(&state) {
+                        Ok(buf) => {
+                            if let Err(e) = crate::persist::write_atomic(&state_path, &buf) {
+                                error!("failed to persist hw_info.plist in re-key task: {e}");
+                            }
+                        }
+                        Err(e) => error!("failed to serialize hw_info.plist in re-key task: {e}"),
+                    }
                 },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -470,31 +491,33 @@ pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnis
     };
     
     
-    plist::to_file_xml(conf_dir.join("gsa.plist"), &GSAConfig {
+    let gsa_config = GSAConfig {
         username: account.username.clone().unwrap(),
         encrypted_password: GSAConfig::encrypt(&account.hashed_password.clone().unwrap())?,
         postdata_done: Some(true),
-    }).unwrap();
+    };
+    crate::persist::write_atomic(&conf_dir.join("gsa.plist"), &plist_to_buf(&gsa_config)?)?;
 
-    let path = conf_dir.join("statuskit.plist");
-    std::fs::write(&path, plist_to_string(&StatusKitState {
+    let sk_path = conf_dir.join("statuskit.plist");
+    let sk_state = StatusKitState {
         my_key: None,
-        ..plist::from_file(&path).unwrap_or_default()
-    }).unwrap()).unwrap();
+        ..plist::from_file(&sk_path).unwrap_or_default()
+    };
+    crate::persist::write_atomic(&sk_path, &plist_to_buf(&sk_state)?)?;
     
     let mobileme = delegates.mobileme.unwrap();
     let findmy = FindMyState::new(dsid.clone());
 
-    let id_path = conf_dir.join("findmy.plist");
-    if !id_path.exists() {
-        std::fs::write(id_path, findmy.encode()?).unwrap();
+    let findmy_path = conf_dir.join("findmy.plist");
+    if !findmy_path.exists() {
+        crate::persist::write_atomic(&findmy_path, &findmy.encode()?)?;
     }
 
     let shared_streams = SharedStreamsState::new(dsid.clone(), &mobileme);
     if let Some(shared_streams) = shared_streams {
-        let id_path = conf_dir.join("sharedstreams.plist");
-        if !id_path.exists() {
-            std::fs::write(id_path, plist_to_string(&shared_streams).unwrap()).unwrap(); 
+        let ss_path = conf_dir.join("sharedstreams.plist");
+        if !ss_path.exists() {
+            crate::persist::write_atomic(&ss_path, &plist_to_buf(&shared_streams)?)?;
         }
     } else {
         warn!("missing shared streams tokens!");
@@ -502,9 +525,9 @@ pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnis
 
     let cloudkitstate = CloudKitState::new(dsid.clone());
     if let Some(cloudkitstate) = cloudkitstate {
-        let id_path = conf_dir.join("cloudkit.plist");
-        if !id_path.exists() {
-            std::fs::write(id_path, plist_to_string(&cloudkitstate).unwrap()).unwrap();
+        let ck_path = conf_dir.join("cloudkit.plist");
+        if !ck_path.exists() {
+            crate::persist::write_atomic(&ck_path, &plist_to_buf(&cloudkitstate)?)?;
         }
     } else {
         warn!("missing cloudkit tokens!");
@@ -512,9 +535,9 @@ pub async fn do_login(path: String, account: &Arc<Mutex<AppleAccount<DefaultAnis
 
     let keychain = KeychainClientState::new(dsid.clone(), adsid.to_string(), &mobileme);
     if let Some(keychain) = keychain {
-        let id_path = conf_dir.join("keychain.plist");
-        if !id_path.exists() {
-            std::fs::write(id_path, plist_to_string(&keychain).unwrap()).unwrap();
+        let kc_path = conf_dir.join("keychain.plist");
+        if !kc_path.exists() {
+            crate::persist::write_atomic(&kc_path, &plist_to_buf(&keychain)?)?;
         }
     } else {
         warn!("missing keychain tokens!");
@@ -652,11 +675,18 @@ fn reset_user(path: &str) {
     let _ = std::fs::remove_file(dir.join("passwords.plist"));
     let _ = std::fs::remove_file(dir.join("sharedstreams.plist"));
 
-    let path = dir.join("statuskit.plist");
-    std::fs::write(&path, plist_to_string(&StatusKitState {
+    let sk_path = dir.join("statuskit.plist");
+    match plist_to_buf(&StatusKitState {
         my_key: None,
-        ..plist::from_file(&path).unwrap_or_default()
-    }).unwrap()).unwrap();
+        ..plist::from_file(&sk_path).unwrap_or_default()
+    }) {
+        Ok(buf) => {
+            if let Err(e) = crate::persist::write_atomic(&sk_path, &buf) {
+                error!("failed to reset statuskit.plist: {e}");
+            }
+        }
+        Err(e) => error!("failed to serialize statuskit.plist during reset: {e}"),
+    }
 }
 
 /// Wipe the persisted login so the next launch goes through onboarding.
@@ -693,7 +723,7 @@ pub async fn register_ids(path: String, config: &JoinedOSConfig, aps: &APSConnec
         }
     }
     let id_path = dir.join("id.plist");
-    std::fs::write(&id_path, plist_to_string(&users).unwrap()).unwrap();
+    crate::persist::write_atomic(&id_path, &plist_to_buf(&users)?)?;
 
     Ok((Some(users), None))
 }
@@ -713,7 +743,14 @@ pub async fn make_imclient(path: String, conn: &APSConnection, users: &[IDSUser]
     Arc::new(IMClient::new(conn.clone(), users.to_vec(), identity.clone(),
     &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE], dir.join("id_cache.plist"), conn.os_config.clone(), Box::new(move |updated_keys| {
         println!("updated keys!!!");
-        std::fs::write(&id_path, plist_to_string(&updated_keys).unwrap()).unwrap();
+        match plist_to_buf(&updated_keys) {
+            Ok(buf) => {
+                if let Err(e) = crate::persist::write_atomic(&id_path, &buf) {
+                    error!("failed to persist id.plist in key-update callback: {e}");
+                }
+            }
+            Err(e) => error!("failed to serialize id.plist in key-update callback: {e}"),
+        }
     })).await)
 }
 
