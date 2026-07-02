@@ -20,8 +20,8 @@ use crate::gtk_bridge;
 use crate::protocol::{Backend, Connection, ImClient, RecvEvent, friendly_category_message};
 use crate::store::{
     group_tapbacks_by_target, live_tapbacks, AttachmentKind, AttachmentRecord, ChatRef,
-    ChatSummary, IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, Store,
-    StoredAttachment, StoredMessage,
+    ChatSummary, IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, NewMessage,
+    Store, StoredAttachment, StoredMessage,
 };
 #[cfg(feature = "rustpush")]
 use crate::store::Tapback;
@@ -30,6 +30,12 @@ use rustpush::{Reaction, ReactMessageType};
 use tokio::sync::oneshot;
 
 mod avatar;
+mod pending;
+
+/// Debounce duration for coalescing desktop notifications per chat.
+const NOTIFICATION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Max age before a pending notification fires unconditionally.
+const NOTIFICATION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Callback type for the reaction emoji picker: receives the target message
 /// GUID, the reaction index (0-5), and the target message's text (for the
@@ -360,6 +366,8 @@ struct Ui {
     // withdraw it once the chat is read — including reads synced from another
     // device, which clear unread without us opening the chat here.
     notified_chats: Rc<RefCell<HashSet<i64>>>,
+    // Debounce registry for pending notifications.
+    pending_notifications: Rc<RefCell<pending::PendingNotifications>>,
     // Cleared once on the first chat load, to sweep stale notifications left in
     // the center by a previous session (read elsewhere while we were closed).
     notify_swept: Rc<Cell<bool>>,
@@ -674,6 +682,10 @@ pub fn enter_messaging(
         notify_watermark: Rc::new(Cell::new(now_ms())),
         window: Rc::new(RefCell::new(None)),
         notified_chats: Rc::new(RefCell::new(HashSet::new())),
+        pending_notifications: Rc::new(RefCell::new(pending::PendingNotifications::new(
+            NOTIFICATION_DEBOUNCE,
+            NOTIFICATION_MAX_AGE,
+        ))),
         notify_swept: Rc::new(Cell::new(false)),
         preview_cards: Rc::new(RefCell::new(std::collections::HashMap::new())),
         pending_attachment: Rc::new(RefCell::new(None)),
@@ -2732,7 +2744,8 @@ impl Ui {
         // Drop the empty-state illustration now that a real conversation is
         // loaded into the content pane.
         self.content_stack.set_visible_child_name("chat");
-        // Opening the chat means reading it — clear any pending notification.
+        // Opening the chat means reading it — cancel any pending notification.
+        self.pending_notifications.borrow_mut().cancel(chat.id);
         self.withdraw_chat_notification(chat.id);
 
         let store = self.store.clone();
@@ -4143,15 +4156,23 @@ impl Ui {
                     e.1 = preview;
                     e.2 += 1;
                 }
+                let mut last_msg_per_chat: std::collections::HashMap<i64, NewMessage> =
+                    std::collections::HashMap::new();
+                for m in &rows {
+                    last_msg_per_chat.insert(m.chat_id, m.clone());
+                }
                 ui.notify_watermark.set(max_date);
 
                 let open_id = ui.open_summary.borrow().as_ref().map(|c| c.id);
                 let focused = ui.focused.get();
+                let now = std::time::Instant::now();
                 for chat_id in order {
                     let (sender, preview, count) = per_chat.remove(&chat_id).unwrap();
+                    let last_msg = last_msg_per_chat.remove(&chat_id).unwrap();
                     // Don't notify for the chat the user is actively viewing.
                     if focused && open_id == Some(chat_id) {
                         ui.withdraw_chat_notification(chat_id);
+                        ui.pending_notifications.borrow_mut().cancel(chat_id);
                         continue;
                     }
                     let summary = ui.chats.borrow().iter().find(|c| c.id == chat_id).cloned();
@@ -4167,7 +4188,85 @@ impl Ui {
                     if count > 1 {
                         body = format!("{body} (+{} earlier)", count - 1);
                     }
-                    ui.show_chat_notification(chat_id, &title, &body);
+
+                    match ui
+                        .pending_notifications
+                        .borrow_mut()
+                        .insert_or_replace(chat_id, last_msg, now)
+                    {
+                        pending::InsertResult::Fire(_) => {
+                            ui.show_chat_notification(chat_id, &title, &body);
+                        }
+                        pending::InsertResult::Schedule(at) => {
+                            let pending = ui.pending_notifications.clone();
+                            let ui2 = ui.clone();
+                            glib::timeout_add_local_once(
+                                at.saturating_duration_since(std::time::Instant::now()),
+                                move || {
+                                    let entry = pending.borrow_mut().take(chat_id);
+                                    if let Some(entry) = entry {
+                                        let store = ui2.store.clone();
+                                        let cid = chat_id;
+                                        gtk_bridge::spawn(
+                                            async move {
+                                                store.latest_unread_incoming(cid).await
+                                            },
+                                            move |result| {
+                                                if result.ok().flatten().is_some() {
+                                                    // Chat is still unread — show notification.
+                                                    let preview = entry
+                                                        .last_message
+                                                        .text
+                                                        .as_deref()
+                                                        .map(strip_marker)
+                                                        .filter(|t| !t.is_empty())
+                                                        .unwrap_or_else(|| {
+                                                            if entry.last_message.has_attachment
+                                                            {
+                                                                "Sent an attachment".to_string()
+                                                            } else {
+                                                                String::new()
+                                                            }
+                                                        });
+                                                    let sender = entry
+                                                        .last_message
+                                                        .sender
+                                                        .unwrap_or_default();
+                                                    let summary = ui2
+                                                        .chats
+                                                        .borrow()
+                                                        .iter()
+                                                        .find(|c| c.id == cid)
+                                                        .cloned();
+                                                    let (title, is_group) = match &summary {
+                                                        Some(c) => (
+                                                            chat_title(c, &ui2.handles),
+                                                            c.is_group,
+                                                        ),
+                                                        None => {
+                                                            (pretty_addr(&sender), false)
+                                                        }
+                                                    };
+                                                    let body = if is_group && !sender.is_empty() {
+                                                        format!(
+                                                            "{}: {}",
+                                                            pretty_addr(&sender),
+                                                            preview
+                                                        )
+                                                    } else {
+                                                        preview
+                                                    };
+                                                    ui2.show_chat_notification(
+                                                        cid, &title, &body,
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                    }
                 }
             },
         );
