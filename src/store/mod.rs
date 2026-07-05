@@ -109,6 +109,24 @@ CREATE TABLE link_preview(
 );
 ";
 
+// Added in v7: contact cache (address-book lookup for participant display names
+// and avatars). `contact_address` rows cascade on contact delete and are
+// replaced atomically during upsert.
+const DDL_V7: &str = "
+CREATE TABLE contact(
+    uid           TEXT PRIMARY KEY,
+    display_name  TEXT NOT NULL,
+    avatar        BLOB
+);
+CREATE TABLE contact_address(
+    contact_uid   TEXT NOT NULL REFERENCES contact(uid) ON DELETE CASCADE,
+    value         TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    PRIMARY KEY(contact_uid, value)
+);
+CREATE INDEX idx_contact_address_value ON contact_address(value);
+";
+
 // --- sync core (all logic; unit-tested) ---
 
 /// Apply pending migrations and enable FK enforcement on this connection.
@@ -149,6 +167,12 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         // confirmed sent by the server yet.
         c.execute_batch("ALTER TABLE message ADD COLUMN pending INTEGER NOT NULL DEFAULT 0;")?;
         v = 6;
+    }
+    if v < 7 {
+        // Contact cache: address-book lookup for participant display names
+        // and avatars.
+        c.execute_batch(DDL_V7)?;
+        v = 7;
     }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
@@ -708,6 +732,117 @@ pub fn query_tapbacks_for_chat(c: &Connection, chat_id: i64) -> rusqlite::Result
     rows.collect()
 }
 
+// --- contact cache ---
+
+/// Upsert a contact. If a contact with the same `uid` already exists, replace
+/// its display name, avatar, and address set atomically (old addresses are
+/// deleted before the new ones are inserted).
+#[allow(dead_code)]
+pub fn upsert_contact(c: &Connection, contact: &Contact) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO contact(uid, display_name, avatar) VALUES (?1, ?2, ?3)
+         ON CONFLICT(uid) DO UPDATE SET
+            display_name = excluded.display_name,
+            avatar      = excluded.avatar",
+        params![contact.uid, contact.display_name, contact.avatar],
+    )?;
+    // Replace the address set: delete all old rows, insert new ones.
+    c.execute(
+        "DELETE FROM contact_address WHERE contact_uid = ?1",
+        params![contact.uid],
+    )?;
+    for addr in &contact.addresses {
+        c.execute(
+            "INSERT INTO contact_address(contact_uid, value, kind) VALUES (?1, ?2, ?3)",
+            params![contact.uid, addr.value, addr.kind],
+        )?;
+    }
+    Ok(())
+}
+
+/// Load all addresses for a contact (used internally by
+/// [`lookup_contact_by_addr`]).
+#[allow(dead_code)]
+fn load_contact_addresses(c: &Connection, uid: &str) -> rusqlite::Result<Vec<ContactAddress>> {
+    let mut stmt = c.prepare(
+        "SELECT value, kind FROM contact_address WHERE contact_uid = ?1 ORDER BY kind, value",
+    )?;
+    let rows = stmt.query_map(params![uid], |r| {
+        Ok(ContactAddress {
+            value: r.get(0)?,
+            kind: r.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Look up a contact by one of its normalized address strings. Returns
+/// `None` when no contact has that address. The returned contact carries
+/// its full address set (not just the matched address).
+#[allow(dead_code)]
+pub fn lookup_contact_by_addr(c: &Connection, addr: &str) -> rusqlite::Result<Option<Contact>> {
+    let maybe = c
+        .query_row(
+            "SELECT c.uid, c.display_name, c.avatar
+             FROM contact c
+             JOIN contact_address a ON a.contact_uid = c.uid
+             WHERE a.value = ?1",
+            params![addr],
+            |r| {
+                Ok(Contact {
+                    uid: r.get(0)?,
+                    display_name: r.get(1)?,
+                    avatar: r.get(2)?,
+                    addresses: Vec::new(), // filled below
+                })
+            },
+        )
+        .optional()?;
+    match maybe {
+        Some(mut contact) => {
+            contact.addresses = load_contact_addresses(c, &contact.uid)?;
+            Ok(Some(contact))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Remove every row from both contact-cache tables. Subsequent lookups
+/// return `None`.
+#[allow(dead_code)]
+pub fn clear_contacts(c: &Connection) -> rusqlite::Result<()> {
+    c.execute_batch("DELETE FROM contact_address; DELETE FROM contact;")?;
+    Ok(())
+}
+
+/// Load every cached contact, with full address sets. Used at startup to
+/// populate the in-memory contact list from the persisted cache so the
+/// sidebar renders with contact names immediately (before the background
+/// EDS refresh updates it).
+#[allow(dead_code)]
+pub fn query_all_contacts(c: &Connection) -> rusqlite::Result<Vec<Contact>> {
+    let mut stmt = c.prepare("SELECT uid, display_name, avatar FROM contact")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<Vec<u8>>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (uid, display_name, avatar) = row?;
+        let addresses = load_contact_addresses(c, &uid)?;
+        out.push(Contact {
+            uid,
+            display_name,
+            avatar,
+            addresses,
+        });
+    }
+    Ok(out)
+}
+
 // --- async wrapper (used by the app) ---
 
 /// Async handle to the message database. Cloneable; all clones share the one
@@ -913,6 +1048,50 @@ impl Store {
         Ok(self
             .conn
             .call(move |c| Ok(message_link_previews_for(c, &guids)?))
+            .await?)
+    }
+
+    /// Remove every row from both contact-cache tables.
+    #[allow(dead_code)]
+    pub async fn clear_contacts(&self) -> Result<()> {
+        self.conn
+            .call(move |c| {
+                clear_contacts(c)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert a contact (replace if same uid).
+    #[allow(dead_code)]
+    pub async fn upsert_contact(&self, contact: Contact) -> Result<()> {
+        self.conn
+            .call(move |c| {
+                upsert_contact(c, &contact)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Look up a contact by one of its normalized address strings.
+    #[allow(dead_code)]
+    pub async fn lookup_contact_by_addr(&self, addr: String) -> Result<Option<Contact>> {
+        Ok(self
+            .conn
+            .call(move |c| Ok(lookup_contact_by_addr(c, &addr)?))
+            .await?)
+    }
+
+    /// Load every cached contact into memory. Used at startup to populate
+    /// the UI's in-memory contact list from the persisted cache so the
+    /// sidebar renders with contact names immediately.
+    #[allow(dead_code)]
+    pub async fn all_contacts(&self) -> Result<Vec<Contact>> {
+        Ok(self
+            .conn
+            .call(|c| Ok(query_all_contacts(c)?))
             .await?)
     }
 }
@@ -1982,11 +2161,13 @@ mod tests {
             "custom_avatar_path column must exist on chat after v5 migration"
         );
 
-        // Assert user_version bumped to 5.
+        // Assert user_version bumped through all migrations applied from a v4
+        // base (v5, v6, v7, …). Update this expected value whenever a new
+        // migration arm is added to `migrate()`.
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 6, "user_version must be 6 after migration");
+        assert_eq!(v, 7, "user_version must be 7 after migration from a v4 base");
     }
 
     #[test]
@@ -2359,5 +2540,234 @@ mod tests {
         );
         assert!(!msg.pending, "pending cleared by reopen");
         assert_eq!(msg.date_delivered, Some(13500), "date_delivered preserved");
+    }
+
+    // -------------------------------------------------------------------
+    // Contact cache (v7) — compile errors = intentional red until the
+    // Contact struct, ContactAddress struct, DDL_V7, migration arm, and
+    // sync functions (upsert_contact, lookup_contact_by_addr, clear_contacts)
+    // land.  All fail to compile because none of those symbols exist.
+    //
+    // Contract (symbols do not exist yet — compile errors = intentional red):
+    //   pub struct ContactAddress {
+    //       pub value: String,   // normalized tel:+… / mailto:…
+    //       pub kind: String,    // "phone" or "email"
+    //   }
+    //   pub struct Contact {
+    //       pub uid: String,
+    //       pub display_name: String,
+    //       pub avatar: Option<Vec<u8>>,
+    //       pub addresses: Vec<ContactAddress>,
+    //   }
+    //   pub fn upsert_contact(c: &Connection, contact: &Contact) -> rusqlite::Result<()>
+    //   pub fn lookup_contact_by_addr(c: &Connection, addr: &str) -> rusqlite::Result<Option<Contact>>
+    //   pub fn clear_contacts(c: &Connection) -> rusqlite::Result<()>
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn contact_lookup_returns_none_when_empty() {
+        let c = db();
+        let got = lookup_contact_by_addr(&c, "tel:+15555550100").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn upsert_contact_then_lookup_by_phone_finds_it() {
+        let c = db();
+        let contact = Contact {
+            uid: "u1".into(),
+            display_name: "Alice".into(),
+            avatar: None,
+            addresses: vec![ContactAddress {
+                value: "tel:+15555550100".into(),
+                kind: "phone".into(),
+            }],
+        };
+        upsert_contact(&c, &contact).unwrap();
+        let got = lookup_contact_by_addr(&c, "tel:+15555550100")
+            .unwrap()
+            .expect("contact should be found by phone");
+        assert_eq!(got.display_name, "Alice");
+        assert_eq!(got.uid, "u1");
+    }
+
+    #[test]
+    fn upsert_contact_then_lookup_by_email_finds_it() {
+        let c = db();
+        let contact = Contact {
+            uid: "u2".into(),
+            display_name: "Bob".into(),
+            avatar: None,
+            addresses: vec![ContactAddress {
+                value: "mailto:bob@example.com".into(),
+                kind: "email".into(),
+            }],
+        };
+        upsert_contact(&c, &contact).unwrap();
+        let got = lookup_contact_by_addr(&c, "mailto:bob@example.com")
+            .unwrap()
+            .expect("contact should be found by email");
+        assert_eq!(got.display_name, "Bob");
+        assert_eq!(got.uid, "u2");
+    }
+
+    #[test]
+    fn upsert_contact_replaces_existing_same_uid() {
+        let c = db();
+        // First upsert: Alice with phone +1 and an avatar.
+        let alice = Contact {
+            uid: "u1".into(),
+            display_name: "Alice".into(),
+            avatar: Some(vec![0x89, 0x50, 0x4e, 0x47]), // fake PNG header bytes
+            addresses: vec![ContactAddress {
+                value: "tel:+1".into(),
+                kind: "phone".into(),
+            }],
+        };
+        upsert_contact(&c, &alice).unwrap();
+
+        // Second upsert: same uid u1, now Bob with phone +2 and no avatar.
+        let bob = Contact {
+            uid: "u1".into(),
+            display_name: "Bob".into(),
+            avatar: None,
+            addresses: vec![ContactAddress {
+                value: "tel:+2".into(),
+                kind: "phone".into(),
+            }],
+        };
+        upsert_contact(&c, &bob).unwrap();
+
+        // Old address (tel:+1) must be gone — full replacement.
+        let old = lookup_contact_by_addr(&c, "tel:+1").unwrap();
+        assert!(old.is_none(), "old address must be replaced");
+
+        // New address resolves to Bob with no avatar.
+        let got = lookup_contact_by_addr(&c, "tel:+2")
+            .unwrap()
+            .expect("new address must resolve");
+        assert_eq!(got.display_name, "Bob");
+        assert!(got.avatar.is_none(), "avatar must be replaced with None");
+        assert_eq!(got.uid, "u1");
+    }
+
+    #[test]
+    fn lookup_by_unknown_address_returns_none() {
+        let c = db();
+        let contact = Contact {
+            uid: "u1".into(),
+            display_name: "Charlie".into(),
+            avatar: None,
+            addresses: vec![ContactAddress {
+                value: "mailto:charlie@example.com".into(),
+                kind: "email".into(),
+            }],
+        };
+        upsert_contact(&c, &contact).unwrap();
+        let got = lookup_contact_by_addr(&c, "tel:+999").unwrap();
+        assert!(got.is_none(), "unknown address must not match");
+    }
+
+    #[test]
+    fn clear_contacts_wipes_cache() {
+        let c = db();
+        let a = Contact {
+            uid: "u1".into(),
+            display_name: "Alice".into(),
+            avatar: None,
+            addresses: vec![ContactAddress {
+                value: "tel:+1".into(),
+                kind: "phone".into(),
+            }],
+        };
+        let b = Contact {
+            uid: "u2".into(),
+            display_name: "Bob".into(),
+            avatar: None,
+            addresses: vec![ContactAddress {
+                value: "tel:+2".into(),
+                kind: "phone".into(),
+            }],
+        };
+        upsert_contact(&c, &a).unwrap();
+        upsert_contact(&c, &b).unwrap();
+
+        clear_contacts(&c).unwrap();
+
+        let got_a = lookup_contact_by_addr(&c, "tel:+1").unwrap();
+        assert!(got_a.is_none(), "first contact wiped");
+        let got_b = lookup_contact_by_addr(&c, "tel:+2").unwrap();
+        assert!(got_b.is_none(), "second contact wiped");
+    }
+
+    #[test]
+    fn two_contacts_distinct_addresses_resolve_independently() {
+        let c = db();
+        let alice = Contact {
+            uid: "u1".into(),
+            display_name: "Alice".into(),
+            avatar: None,
+            addresses: vec![
+                ContactAddress {
+                    value: "tel:+1111".into(),
+                    kind: "phone".into(),
+                },
+                ContactAddress {
+                    value: "mailto:alice@example.com".into(),
+                    kind: "email".into(),
+                },
+            ],
+        };
+        let bob = Contact {
+            uid: "u2".into(),
+            display_name: "Bob".into(),
+            avatar: None,
+            addresses: vec![
+                ContactAddress {
+                    value: "tel:+2222".into(),
+                    kind: "phone".into(),
+                },
+                ContactAddress {
+                    value: "mailto:bob@example.com".into(),
+                    kind: "email".into(),
+                },
+            ],
+        };
+        upsert_contact(&c, &alice).unwrap();
+        upsert_contact(&c, &bob).unwrap();
+
+        let got_alice = lookup_contact_by_addr(&c, "tel:+1111")
+            .unwrap()
+            .expect("Alice by phone");
+        assert_eq!(got_alice.display_name, "Alice");
+        assert_eq!(got_alice.uid, "u1");
+        assert_eq!(got_alice.addresses.len(), 2, "Alice has both addresses");
+
+        let got_alice_email = lookup_contact_by_addr(&c, "mailto:alice@example.com")
+            .unwrap()
+            .expect("Alice by email");
+        assert_eq!(got_alice_email.display_name, "Alice");
+        assert_eq!(got_alice_email.uid, "u1");
+
+        let got_bob = lookup_contact_by_addr(&c, "tel:+2222")
+            .unwrap()
+            .expect("Bob by phone");
+        assert_eq!(got_bob.display_name, "Bob");
+        assert_eq!(got_bob.uid, "u2");
+
+        let got_bob_email = lookup_contact_by_addr(&c, "mailto:bob@example.com")
+            .unwrap()
+            .expect("Bob by email");
+        assert_eq!(got_bob_email.display_name, "Bob");
+        assert_eq!(got_bob_email.uid, "u2");
+    }
+
+    #[test]
+    fn migration_bumps_user_version_to_7() {
+        let c = db();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 7, "migration must bump user_version to 7");
     }
 }

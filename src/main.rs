@@ -13,6 +13,8 @@ mod tray;
 mod ui;
 mod window_state;
 mod attachment_cache;
+mod contacts;
+mod contacts_eds;
 mod demo;
 mod video;
 

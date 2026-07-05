@@ -440,6 +440,30 @@ pub struct LinkPreview {
     pub error: Option<String>,
 }
 
+// --- contact cache ---
+
+/// A cached contact — the contact-store equivalent of a row in the device's
+/// address book, keyed by an opaque stable identifier (`uid`) and carrying a
+/// set of normalized addresses (phone / email) for lookup.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub struct Contact {
+    pub uid: String,
+    pub display_name: String,
+    pub avatar: Option<Vec<u8>>,
+    pub addresses: Vec<ContactAddress>,
+}
+
+/// A single normalized address belonging to a [`Contact`].
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub struct ContactAddress {
+    /// A normalized "tel:+…" / "mailto:…" URI.
+    pub value: String,
+    /// "phone" or "email".
+    pub kind: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -20,8 +20,8 @@ use crate::gtk_bridge;
 use crate::protocol::{Backend, Connection, ImClient, RecvEvent, friendly_category_message};
 use crate::store::{
     group_tapbacks_by_target, live_tapbacks, AttachmentKind, AttachmentRecord, ChatRef,
-    ChatSummary, IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview, NewMessage,
-    Store, StoredAttachment, StoredMessage,
+    ChatSummary, Contact, IncomingMessage, Ingest, LiveReactionSummary, MessageLinkPreview,
+    NewMessage, Store, StoredAttachment, StoredMessage,
 };
 #[cfg(feature = "rustpush")]
 use crate::store::Tapback;
@@ -313,6 +313,7 @@ struct Ui {
     client: ImClient,
     connection: Connection,
     handles: Vec<String>,
+    contacts: Rc<RefCell<Vec<Contact>>>,
     open_summary: Rc<RefCell<Option<ChatSummary>>>,
     // Pagination state for the open chat.
     page_oldest: Rc<RefCell<Option<(i64, i64)>>>,
@@ -657,6 +658,7 @@ pub fn enter_messaging(
         client: client.clone(),
         connection: connection.clone(),
         handles: handles.clone(),
+        contacts: Rc::new(RefCell::new(Vec::new())),
         open_summary: Rc::new(RefCell::new(None)),
         page_oldest: Rc::new(RefCell::new(None)),
         page_has_more: Rc::new(RefCell::new(false)),
@@ -999,7 +1001,45 @@ pub fn enter_messaging(
         .build();
     nav.replace(&[host]);
 
-    ui.reload_chats(|_| {});
+    // --- Contact cache: load persisted cache, then first sidebar render,
+    //     then background EDS refresh. ---
+    // Load the on-disk cache (from the previous run) into memory *before*
+    // the first `reload_chats` so the sidebar renders with contact names
+    // immediately — no flash of bare addresses on second+ launch.
+    let ui_for_cache = ui.clone();
+    let store_for_cache = ui.store.clone();
+    gtk_bridge::spawn(
+        async move { store_for_cache.all_contacts().await },
+        move |result| {
+            if let Ok(cached) = result {
+                *ui_for_cache.contacts.borrow_mut() = cached;
+            }
+            ui_for_cache.reload_chats(|_| {});
+
+            // Now refresh from EDS in the background. On success, update the
+            // in-memory cache and re-render. On failure, the persisted cache
+            // (or empty) stays — graceful degradation.
+            let ui_for_contacts = ui_for_cache.clone();
+            let store_for_contacts = ui_for_contacts.store.clone();
+            gtk_bridge::spawn(
+                async move {
+                    let source = crate::contacts_eds::EdsContactSource;
+                    crate::contacts::refresh_and_collect(&source, &store_for_contacts).await
+                },
+                move |result| {
+                    match result {
+                        Ok(contacts) => {
+                            *ui_for_contacts.contacts.borrow_mut() = contacts;
+                            ui_for_contacts.schedule_refresh();
+                        }
+                        Err(e) => {
+                            eprintln!("contact refresh failed (EDS unavailable?): {e:#}");
+                        }
+                    }
+                },
+            );
+        },
+    );
 
     // Receive loop -> persist -> pulse -> refresh.
     let (tx, rx) = async_channel::unbounded::<RecvEvent>();
@@ -1345,7 +1385,7 @@ impl Ui {
             on_chats(&chats);
             clear(&ui.chat_list);
             for c in &chats {
-                ui.chat_list.append(&chat_row(c, &ui.handles));
+                ui.chat_list.append(&chat_row(c, &ui.handles, &ui.contacts.borrow()));
             }
             // Keep the open chat highlighted across refreshes.
             if let Some(open) = ui.open_summary.borrow().as_ref() {
@@ -1395,6 +1435,31 @@ impl Ui {
 
         let group = adw::PreferencesGroup::new();
         group.add(&to_row);
+
+        // Contact completion popover: shows matching contacts as the user types.
+        let completion_list = gtk::ListBox::new();
+        completion_list.set_selection_mode(gtk::SelectionMode::Single);
+        // Keep keyboard focus on the To entry: the listbox must not grab focus
+        // when it appears, otherwise the user can't keep typing the query.
+        completion_list.set_can_focus(false);
+
+        let completion_scrolled = gtk::ScrolledWindow::new();
+        completion_scrolled.set_child(Some(&completion_list));
+        completion_scrolled.set_max_content_height(200);
+        completion_scrolled.set_propagate_natural_height(true);
+        completion_scrolled.set_propagate_natural_width(true);
+        completion_scrolled.set_min_content_width(320);
+        completion_scrolled.set_can_focus(false);
+
+        let completion_popover = gtk::Popover::new();
+        completion_popover.set_child(Some(&completion_scrolled));
+        // autohide=false so the popover doesn't perform a seat grab that steals
+        // keyboard input from the To entry. We dismiss it manually on selection,
+        // empty query, or click-outside (handled by re-grabbing focus).
+        completion_popover.set_autohide(false);
+        completion_popover.set_has_arrow(false);
+        completion_popover.set_parent(&to_row);
+
         group.add(&name_row);
         group.add(&msg_row);
 
@@ -1407,6 +1472,48 @@ impl Ui {
         error_label.set_margin_top(4);
         error_label.set_visible(false);
         group.add(&error_label);
+
+        // Shared state for the contact completion list: the normalized address
+        // (`tel:…` / `mailto:…`) for each row, indexed by row position.
+        let completion_addrs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        // Parallel to completion_addrs: the display name for each row, used to
+        // pre-fill the Name field as a suggestion when a contact is selected.
+        let completion_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        // When a contact is selected, the Name field is pre-filled with the
+        // contact's display name as a *suggestion*. The suggestion is tracked
+        // here so the send handler can distinguish "user left the suggestion
+        // as-is" (→ no custom name, fall through to contact name) from "user
+        // edited the name" (→ persist as custom_name). An empty suggestion
+        // means "no suggestion was made" (e.g. bare-number entry).
+        let suggested_name: Rc<Cell<Option<String>>> = Rc::new(Cell::new(None));
+        {
+            let completion_addrs = completion_addrs.clone();
+            let completion_names = completion_names.clone();
+            let to_row = to_row.clone();
+            let name_row = name_row.clone();
+            let suggested_name = suggested_name.clone();
+            let completion_popover = completion_popover.clone();
+            completion_list.connect_row_activated(move |_list, row| {
+                let idx = row.index();
+                // Borrow + clone into locals before set_text: set_text fires
+                // `changed`, whose handler borrows completion_addrs mutably, so
+                // the borrows here must be released first (mirrors chat_list's
+                // row_activated at line 728).
+                let addr = completion_addrs.borrow().get(idx as usize).cloned();
+                let name = completion_names.borrow().get(idx as usize).cloned();
+                if let Some(addr) = addr {
+                    to_row.set_text(&addr);
+                }
+                // Pre-fill the Name field with the contact's display name as a
+                // suggestion. The send handler checks suggested_name to decide
+                // whether to persist it as custom_name or treat it as unset.
+                if let Some(name) = name {
+                    name_row.set_text(&name);
+                    suggested_name.set(Some(name));
+                }
+                completion_popover.popdown();
+            });
+        }
 
         let dialog = adw::AlertDialog::new(Some("New Chat"), Some("Start a conversation with a new contact."));
         dialog.set_extra_child(Some(&group));
@@ -1442,16 +1549,96 @@ impl Ui {
         const DEBOUNCE_MS: u64 = 600;
 
           // Enable/disable the Send button based on To + Message fields.
+        let contacts = self.contacts.clone();
         {
             let to_row = to_row.clone();
             let msg_row = msg_row.clone();
             let update_send_sensitivity = update_send_sensitivity.clone();
             let debounce_source = debounce_source.clone();
             let error_label = error_label.clone();
+            let completion_list = completion_list.clone();
+            let completion_popover = completion_popover.clone();
+            let completion_addrs = completion_addrs.clone();
+            let contacts = contacts.clone();
             to_row.clone().connect_changed(move |_| {
                 let to = to_row.text();
                 let msg = msg_row.text();
                 update_send_sensitivity(&to, &msg);
+
+                // Update contact completion list: search contacts and populate
+                // the dropdown with matching entries.
+                {
+                    let contacts_borrowed = contacts.borrow();
+                    let trimmed = to.trim();
+                    if !trimmed.is_empty()
+                        && trimmed.contains(|c: char| c.is_alphanumeric())
+                    {
+                        let matches =
+                            crate::contacts::search_contacts(&contacts_borrowed, trimmed);
+                        if matches.is_empty() {
+                            completion_popover.popdown();
+                        } else {
+                            // Clear existing rows.
+                            while let Some(child) = completion_list.first_child() {
+                                completion_list.remove(&child);
+                            }
+                            let mut addrs = completion_addrs.borrow_mut();
+                            let mut names = completion_names.borrow_mut();
+                            addrs.clear();
+                            names.clear();
+                            for contact in matches {
+                                // Prefer a phone address (iMessage typically
+                                // starts from a phone), fall back to email.
+                                let addr_value = contact
+                                    .addresses
+                                    .iter()
+                                    .find(|a| a.kind == "phone")
+                                    .or_else(|| contact.addresses.first())
+                                    .map(|a| a.value.clone())
+                                    .unwrap_or_default();
+                                addrs.push(addr_value.clone());
+                                names.push(contact.display_name.clone());
+                                // Build the row: display name + first address.
+                                let row = gtk::ListBoxRow::new();
+                                let hbox = gtk::Box::builder()
+                                    .orientation(gtk::Orientation::Horizontal)
+                                    .spacing(8)
+                                    .margin_start(12)
+                                    .margin_end(12)
+                                    .margin_top(6)
+                                    .margin_bottom(6)
+                                    .build();
+                                let name_label = gtk::Label::new(Some(&contact.display_name));
+                                name_label.set_hexpand(true);
+                                name_label.set_xalign(0.0);
+                                let addr_label =
+                                    gtk::Label::new(Some(&pretty_addr(&addr_value)));
+                                addr_label.set_xalign(0.0);
+                                addr_label.add_css_class("dim-label");
+                                hbox.append(&name_label);
+                                hbox.append(&addr_label);
+                                row.set_child(Some(&hbox));
+                                completion_list.append(&row);
+                            }
+                            completion_popover.popup();
+                            // The popover's map/focus cycle runs in this
+                            // main-loop iteration; restore focus on the next
+                            // idle so it takes effect after the popover settles.
+                            // grab_focus_without_selecting avoids the select-all
+                            // that grab_focus would cause, and set_position puts
+                            // the cursor at the end so typing appends.
+                            let row = to_row.clone();
+                            glib::idle_add_local(move || {
+                                row.grab_focus_without_selecting();
+                                let len = row.text().len() as i32;
+                                row.set_position(len);
+                                glib::ControlFlow::Break
+                            });
+                        }
+                    } else {
+                        completion_popover.popdown();
+                    }
+                }
 
                 // Cancel any pending debounce; schedule a new one.
                 if let Some(src) = debounce_source.borrow_mut().take() {
@@ -1511,7 +1698,12 @@ impl Ui {
                 name_row.set_text("");
                 msg_row.set_text("");
                 dlg.close();
-                let name_owned: Option<String> = if name.is_empty() {
+                // If the Name field holds the auto-filled suggestion verbatim, treat it as
+                // unset — the chat will resolve the contact name dynamically. Only
+                // persist a custom_name if the user actually edited the field.
+                let suggestion = suggested_name.take();
+                let is_suggestion = suggestion.as_deref() == Some(name.as_str());
+                let name_owned: Option<String> = if name.is_empty() || is_suggestion {
                     None
                 } else {
                     Some(name.to_string())
@@ -2009,7 +2201,7 @@ impl Ui {
         let derived = {
             let mut c = chat.clone();
             c.custom_name = None;
-            chat_title(&c, &self.handles)
+            chat_title(&c, &self.handles, &self.contacts.borrow())
         };
 
         // --- Name section ---
@@ -2536,7 +2728,7 @@ impl Ui {
                             }
                             // NoChange: leave custom_avatar_path as-is.
                             ui2.content_page
-                                .set_title(&chat_title(open, &ui2.handles));
+                                .set_title(&chat_title(open, &ui2.handles, &ui2.contacts.borrow()));
                         }
                     }
                     ui2.reload_chats(|_| {});
@@ -2737,7 +2929,7 @@ impl Ui {
         self.hide_typing_indicator();
         self.clear_pending_attachment();
         *self.open_summary.borrow_mut() = Some(chat.clone());
-        self.content_page.set_title(&chat_title(chat, &self.handles));
+        self.content_page.set_title(&chat_title(chat, &self.handles, &self.contacts.borrow()));
         self.rename_button.set_sensitive(true);
         self.split.set_show_content(true);
         self.compose_outer.set_visible(true);
@@ -2793,7 +2985,7 @@ impl Ui {
                 let on_reaction = ui.make_reaction_handler();
                 let on_edit = ui.make_edit_handler();
                 let on_retry = ui.make_retry_handler();
-                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), on_edit.as_ref(), on_retry.as_ref(), &reactions);
+                let (marker, chip_map) = populate_messages(&ui.msg_container, &msgs, is_group, anchor, &previews, &ui.preview_cards, on_reaction.as_ref(), on_edit.as_ref(), on_retry.as_ref(), &reactions, &ui.handles, &ui.contacts.borrow());
                 *ui.current_chips.borrow_mut() = chip_map;
                 *ui.current_reactions.borrow_mut() = reactions.clone();
                 *ui.unread_marker_shown.borrow_mut() = marker.is_some();
@@ -2949,6 +3141,8 @@ impl Ui {
                             on_retry.as_ref(),
                             &reactions,
                             prev_msg,
+                            &ui.handles,
+                            &ui.contacts.borrow(),
                         );
                         ui.current_chips.borrow_mut().extend(chip_map);
                         *ui.current_reactions.borrow_mut() = reactions.clone();
@@ -3071,6 +3265,8 @@ impl Ui {
                             on_edit.as_ref(),
                             on_retry.as_ref(),
                             &reactions,
+                            &ui.handles,
+                            &ui.contacts.borrow(),
                         );
                         *ui.current_chips.borrow_mut() = chip_map;
                         *ui.current_reactions.borrow_mut() = reactions.clone();
@@ -3211,6 +3407,8 @@ impl Ui {
                     on_retry.as_ref(),
                     &reactions,
                     None,
+                    &ui.handles,
+                    &ui.contacts.borrow(),
                 );
                 ui.current_chips.borrow_mut().extend(chip_map);
                 *ui.current_reactions.borrow_mut() = reactions.clone();
@@ -3361,6 +3559,8 @@ impl Ui {
                     on_edit.as_ref(),
                     on_retry.as_ref(),
                     &reactions,
+                    &ui.handles,
+                    &ui.contacts.borrow(),
                 );
                 *ui.current_chips.borrow_mut() = chip_map;
                 *ui.current_reactions.borrow_mut() = reactions.clone();
@@ -4187,7 +4387,7 @@ impl Ui {
                     }
                     let summary = ui.chats.borrow().iter().find(|c| c.id == chat_id).cloned();
                     let (title, is_group) = match &summary {
-                        Some(c) => (chat_title(c, &ui.handles), c.is_group),
+                        Some(c) => (chat_title(c, &ui.handles, &ui.contacts.borrow()), c.is_group),
                         None => (pretty_addr(&sender), false),
                     };
                     let mut body = if is_group && !sender.is_empty() {
@@ -4250,7 +4450,7 @@ impl Ui {
                                                         .cloned();
                                                     let (title, is_group) = match &summary {
                                                         Some(c) => (
-                                                            chat_title(c, &ui2.handles),
+                                                            chat_title(c, &ui2.handles, &ui2.contacts.borrow()),
                                                             c.is_group,
                                                         ),
                                                         None => {
@@ -4449,6 +4649,8 @@ fn build_message_widgets(
     on_retry: Option<&Rc<RetryHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
     prev: Option<&StoredMessage>,
+    handles: &[String],
+    contacts: &[Contact],
 ) -> (Vec<gtk::Widget>, Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     let mut out = Vec::with_capacity(msgs.len());
     let mut marker: Option<gtk::Widget> = None;
@@ -4488,7 +4690,7 @@ fn build_message_widgets(
         let chip = reactions
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
-        let ctx = MessageContext { m, show_header, top, previews, preview_cards };
+        let ctx = MessageContext { m, show_header, top, previews, preview_cards, handles, contacts };
         let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, on_retry, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
@@ -4585,6 +4787,8 @@ fn populate_messages(
     on_edit: Option<&Rc<EditHandler>>,
     on_retry: Option<&Rc<RetryHandler>>,
     reactions: &std::collections::BTreeMap<String, Vec<LiveReactionSummary>>,
+    handles: &[String],
+    contacts: &[Contact],
 ) -> (Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     clear_box(container);
     // Stale card handles from the previous render are about to be destroyed
@@ -4643,14 +4847,13 @@ fn populate_messages(
         let chip = reactions
             .get(&m.guid)
             .map(|chips| reaction_chips_row(chips));
-        let ctx = MessageContext { m, show_header, top, previews, preview_cards };
+        let ctx = MessageContext { m, show_header, top, previews, preview_cards, handles, contacts };
         let (row, bubble_or_overlay) = message_widget(ctx, is_group, on_reaction, on_edit, on_retry, chip.as_ref());
         let bubble_widget = match &bubble_or_overlay {
             Some(b) => b.clone(),
             None => row.clone(),
         };
         container.append(&row);
-
         // Record chip entry for in-place update support.
         let entry = ChipEntry {
             bubble: bubble_widget,
@@ -5331,8 +5534,8 @@ pub async fn apply_chat_edit(
 }
 
 /// A sidebar row: avatar + chat name + unread badge.
-fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
-    let title = chat_title(c, handles);
+fn chat_row(c: &ChatSummary, handles: &[String], contacts: &[Contact]) -> gtk::ListBoxRow {
+    let title = chat_title(c, handles, contacts);
     let row = gtk::ListBoxRow::new();
     row.add_css_class("navigation-sidebar-row");
 
@@ -5348,9 +5551,13 @@ fn chat_row(c: &ChatSummary, handles: &[String]) -> gtk::ListBoxRow {
     let avatar = avatar::AvatarWidget::new(36, &title);
     avatar.widget().set_hexpand(false);
 
-    // Override with custom avatar photo if one is set and loadable.
+    // Precedence: custom avatar photo (file on disk) → contact photo (EDS) → initials.
     if let Some(path) = chat_avatar_custom_path(c) {
         if let Some(texture) = load_texture(path) {
+            avatar.set_custom_image(Some(&texture));
+        }
+    } else if let Some(bytes) = crate::contacts::chat_avatar_bytes(c, handles, contacts) {
+        if let Some(texture) = texture_from_bytes(bytes) {
             avatar.set_custom_image(Some(&texture));
         }
     }
@@ -5385,6 +5592,8 @@ struct MessageContext<'a> {
     top: i32,
     previews: &'a std::collections::HashMap<(String, i64), MessageLinkPreview>,
     preview_cards: &'a Rc<RefCell<std::collections::HashMap<(String, i64), gtk::Widget>>>,
+    handles: &'a [String],
+    contacts: &'a [Contact],
 }
 
 /// One message in the timeline. Incoming messages are grey bubbles on the left
@@ -5419,7 +5628,7 @@ fn incoming_message(
     on_reaction: Option<&Rc<ReactionHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
-    let MessageContext { m, show_header, top, previews, preview_cards } = ctx;
+    let MessageContext { m, show_header, top, previews, preview_cards, handles, contacts } = ctx;
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -5432,8 +5641,20 @@ fn incoming_message(
     // Avatars (and their continuation spacer) only in group chats.
     if is_group {
         if show_header {
-            let avatar = avatar::AvatarWidget::new(28, &sender_display(m));
+            let avatar = avatar::AvatarWidget::new(28, &sender_display(m, handles, contacts));
             avatar.widget().set_valign(gtk::Align::Start);
+            // Contact photo if the sender is in the address book.
+            if let Some(sender) = m.sender.as_deref() {
+                if let Some(contact) = crate::contacts::find_contact(contacts, sender) {
+                    if let Some(bytes) = &contact.avatar {
+                        if !bytes.is_empty() {
+                            if let Some(texture) = texture_from_bytes(bytes) {
+                                avatar.set_custom_image(Some(&texture));
+                            }
+                        }
+                    }
+                }
+            }
             row.append(avatar.widget());
         } else {
             let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -5450,7 +5671,7 @@ fn incoming_message(
 
     if is_group && show_header {
         let name = gtk::Label::builder()
-            .label(sender_display(m))
+            .label(sender_display(m, handles, contacts))
             .xalign(0.0)
             .build();
         name.add_css_class("sender-name");
@@ -5544,7 +5765,7 @@ fn own_message(
     on_retry: Option<&Rc<RetryHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
-    let MessageContext { m, show_header, top, previews, preview_cards } = ctx;
+    let MessageContext { m, show_header, top, previews, preview_cards, .. } = ctx;
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_start(56)
@@ -5702,6 +5923,11 @@ fn message_body(
 /// (and surrounding whitespace) so attachment-only messages read as empty.
 fn strip_marker(s: &str) -> String {
     s.replace('\u{FFFC}', "").trim().to_string()
+}
+
+/// Decode raw image bytes (PNG/JPEG/etc.) into a `gdk::Texture` for avatar display.
+fn texture_from_bytes(bytes: &[u8]) -> Option<gtk::gdk::Texture> {
+    gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(bytes)).ok()
 }
 
 /// Load a texture from `path`. HEIC/HEIF files are decoded via libheif-rs;
@@ -6783,45 +7009,18 @@ fn typing_bubble() -> gtk::Widget {
     bubble.upcast()
 }
 
-fn chat_title(c: &ChatSummary, handles: &[String]) -> String {
-    // A user-set name wins over everything.
-    if let Some(n) = &c.custom_name {
-        if !n.trim().is_empty() {
-            return n.clone();
-        }
-    }
-    if let Some(n) = &c.display_name {
-        if !n.is_empty() {
-            return n.clone();
-        }
-    }
-    let is_me = |p: &str| handles.iter().any(|h| h.as_str().eq_ignore_ascii_case(p));
-    let others: Vec<String> = c
-        .participants
-        .iter()
-        .filter(|p| !is_me(p.as_str()))
-        .map(|p| pretty_addr(p))
-        .collect();
-    if !others.is_empty() {
-        return others.join(", ");
-    }
-    // Note-to-self (only our own handle) or empty: show what we have.
-    let all: Vec<String> = c.participants.iter().map(|p| pretty_addr(p)).collect();
-    if all.is_empty() {
-        c.key.clone()
-    } else {
-        all.join(", ")
-    }
+fn chat_title(c: &ChatSummary, handles: &[String], contacts: &[Contact]) -> String {
+    crate::contacts::chat_display_title(c, handles, contacts)
 }
 
-fn sender_display(m: &StoredMessage) -> String {
+fn sender_display(m: &StoredMessage, handles: &[String], contacts: &[Contact]) -> String {
     if m.is_from_me {
         "You".to_string()
     } else {
-        m.sender
-            .as_deref()
-            .map(pretty_addr)
-            .unwrap_or_else(|| "Unknown".to_string())
+        match m.sender.as_deref() {
+            Some(addr) => crate::contacts::participant_display_name(addr, handles, contacts),
+            None => "Unknown".to_string(),
+        }
     }
 }
 
