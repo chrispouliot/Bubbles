@@ -2933,10 +2933,15 @@ impl Ui {
                         let prev_msg = prev_guids
                             .last()
                             .and_then(|g| msgs.iter().find(|m| &m.guid == g));
-                        let (widgets, _marker, chip_map) = build_message_widgets(
+                        let anchor = if !*ui.unread_marker_shown.borrow() {
+                            ui.unread.borrow().as_ref().map(|(g, _)| g.clone())
+                        } else {
+                            None
+                        };
+                        let (widgets, marker, chip_map) = build_message_widgets(
                             &new_tail,
                             is_group,
-                            None,
+                            anchor.as_deref(),
                             &previews,
                             &ui.preview_cards,
                             on_reaction.as_ref(),
@@ -2949,6 +2954,11 @@ impl Ui {
                         *ui.current_reactions.borrow_mut() = reactions.clone();
                         for w in &widgets {
                             ui.msg_container.append(w);
+                        }
+                        if let Some(w) = marker {
+                            *ui.unread_marker.borrow_mut() = Some(w.clone());
+                            *ui.unread_marker_shown.borrow_mut() = true;
+                            ui.update_unread_pill();
                         }
                         // Handle the receipt action.
                         match receipt {
@@ -4324,6 +4334,7 @@ impl Ui {
                     // No repopulate here — that's what was causing the flicker.
                     ui.maybe_send_read(&chat);
                     ui.arm_unread_dismiss();
+                    ui.scroll_to(ScrollTo::Bottom);
                 } else {
                     // Already read (e.g. on another device): clear any divider
                     // still lingering from that session.
