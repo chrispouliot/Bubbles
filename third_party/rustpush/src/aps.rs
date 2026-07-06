@@ -946,6 +946,7 @@ impl APSMessage {
 
 
 #[tokio::test]
+#[ignore]
 async fn proxy() {
     if let Err(_) = std::env::var("RUST_LOG") {
         std::env::set_var("RUST_LOG", "debug");

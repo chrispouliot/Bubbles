@@ -277,13 +277,27 @@ impl Backend for StubBackend {
 
     async fn setup_keychain_clique(
         &self,
-        _password: &str,
+        _escrow_passcode: &str,
+        _device_password: &str,
     ) -> std::result::Result<(), String> {
         Ok(())
     }
 
     async fn is_keychain_clique_set_up(&self) -> bool {
         self.clique_set_up
+    }
+
+    async fn setup_keychain_clique_with_bottle(
+        &self,
+        _selected_bottle: &crate::api::EscrowData,
+        _escrow_passcode: &str,
+        _device_password: &str,
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    async fn get_viable_escrow_bottles(&self) -> super::BottlesLookup {
+        super::BottlesLookup::NoBottles
     }
 }
 
@@ -469,18 +483,19 @@ mod tests {
     async fn setup_keychain_clique_returns_ok() {
         // Pin: `Backend::setup_keychain_clique` exists on the trait with
         // signature
-        //   `async fn setup_keychain_clique(&self, password: &str) -> Result<()>`
+        //   `async fn setup_keychain_clique(&self, escrow_passcode: &str,
+        //    device_password: &str) -> Result<()>`
         // and the `StubBackend` implementation returns `Ok(())` without making
         // any network calls. This is the contract for the iCloud Keychain
         // clique-setup unit. The stub is deliberately offline — it proves the
         // trait method compiles and defaults to success for click-through
         // iteration.
         let backend = StubBackend::default();
-        let result = backend.setup_keychain_clique("test-password").await;
+        let result = backend.setup_keychain_clique("test-escrow", "test-device").await;
         assert!(
             result.is_ok(),
             "StubBackend::setup_keychain_clique should return Ok(()) for any \
-             password, got {result:?}"
+             secrets, got {result:?}"
         );
     }
 

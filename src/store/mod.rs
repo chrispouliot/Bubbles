@@ -843,6 +843,31 @@ pub fn query_all_contacts(c: &Connection) -> rusqlite::Result<Vec<Contact>> {
     Ok(out)
 }
 
+// --- local chat deletion ---
+
+/// Delete the selected chats and cascade-delete their messages,
+/// chat_participant rows, and attachments (via existing FK CASCADE).
+/// After deletion, sweep handles that are no longer referenced by
+/// any remaining chat_participant or message sender.
+/// Empty `chat_ids` is a no-op.
+#[allow(dead_code)]
+pub fn delete_chats_blocking(c: &mut Connection, chat_ids: &[i64]) -> rusqlite::Result<()> {
+    if chat_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = c.transaction()?;
+    let placeholders = chat_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM chat WHERE id IN ({placeholders})");
+    tx.execute(&sql, params_from_iter(chat_ids))?;
+    // Sweep handles no longer referenced by any chat_participant or message sender.
+    tx.execute_batch(
+        "DELETE FROM handle
+         WHERE id NOT IN (SELECT handle_id FROM chat_participant)
+           AND id NOT IN (SELECT sender_handle_id FROM message WHERE sender_handle_id IS NOT NULL)",
+    )?;
+    tx.commit()
+}
+
 // --- async wrapper (used by the app) ---
 
 /// Async handle to the message database. Cloneable; all clones share the one
@@ -1093,6 +1118,19 @@ impl Store {
             .conn
             .call(|c| Ok(query_all_contacts(c)?))
             .await?)
+    }
+
+    /// Delete the selected chats and cascade-delete their messages,
+    /// chat_participant rows, and attachments. Sweeps orphaned handles.
+    #[allow(dead_code)]
+    pub async fn delete_chats(&self, chat_ids: Vec<i64>) -> Result<()> {
+        self.conn
+            .call(move |c| {
+                delete_chats_blocking(c, &chat_ids)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -2769,5 +2807,220 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 7, "migration must bump user_version to 7");
+    }
+
+    // -------------------------------------------------------------------
+    // Local chat deletion — compile errors = intentional red until the
+    // `delete_chats_blocking` function lands. The test fails to compile
+    // because the symbol does not exist; that compile error is the
+    // expected "red" for a fresh spec.
+    //
+    // Contract:
+    //   pub fn delete_chats_blocking(
+    //       c: &mut Connection,
+    //       chat_ids: &[i64],
+    //   ) -> rusqlite::Result<()>
+    //
+    // Behavior:
+    //   * Deletes the selected chat rows and cascades to their messages,
+    //     chat_participant rows, and attachments via the existing FK
+    //     CASCADE on chat/message/attachment.
+    //   * Sweeps handles orphaned by the deletion (no longer referenced
+    //     by any chat_participant or any message.sender_handle_id).
+    //   * Preserves handles still referenced by remaining chats or
+    //     remaining messages.
+    //   * Non-selected chats and their messages are untouched.
+    //   * Empty `chat_ids` input is a no-op and returns Ok(()).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn delete_chats_removes_selected_chats_and_cascades() {
+        let mut c = db();
+
+        // Chat A: self + alice. The "self" handle is shared with chat B
+        // (it must survive A's deletion). Alice is unique to A — she must
+        // be swept as an orphan after A is deleted.
+        let chat_a_ref = ChatRef {
+            participants: vec![
+                "mailto:chrispouliot@icloud.com".into(),
+                "mailto:alice@example.com".into(),
+            ],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let mut m_a = msg("A1", 1000);
+        m_a.chat = chat_a_ref;
+        m_a.sender = Some("mailto:alice@example.com".into());
+        m_a.attachments = vec![AttachmentRecord {
+            guid: Some("att-a".into()),
+            mime: Some("image/jpeg".into()),
+            name: Some("a.jpg".into()),
+            total_bytes: Some(1024),
+            local_path: Some("/tmp/a.jpg".into()),
+            part_index: Some(0),
+            is_sticker: false,
+        }];
+        apply_blocking(&mut c, Ingest::Message(m_a)).unwrap();
+
+        // Chat B: self + bob. Two messages, one sender. The "self" handle
+        // is shared with A; bob is unique to B and must survive (still
+        // used by chat B's participant row and by both messages' sender).
+        let chat_b_ref = ChatRef {
+            participants: vec![
+                "mailto:chrispouliot@icloud.com".into(),
+                "mailto:bob@example.com".into(),
+            ],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let mut m_b1 = msg("B1", 2000);
+        m_b1.chat = chat_b_ref.clone();
+        m_b1.sender = Some("mailto:bob@example.com".into());
+        apply_blocking(&mut c, Ingest::Message(m_b1)).unwrap();
+        let mut m_b2 = msg("B2", 2100);
+        m_b2.chat = chat_b_ref;
+        m_b2.sender = Some("mailto:bob@example.com".into());
+        apply_blocking(&mut c, Ingest::Message(m_b2)).unwrap();
+
+        // Resolve chat ids by participant.
+        let chats_before = query_chats(&c).unwrap();
+        assert_eq!(chats_before.len(), 2, "two chats exist before deletion");
+        let chat_a = chats_before
+            .iter()
+            .find(|ch| ch.participants.iter().any(|p| p.contains("alice")))
+            .expect("chat A exists");
+        let chat_b = chats_before
+            .iter()
+            .find(|ch| ch.participants.iter().any(|p| p.contains("bob")))
+            .expect("chat B exists");
+        let chat_a_id = chat_a.id;
+        let chat_b_id = chat_b.id;
+
+        // Sanity: chat A's message has its attachment present.
+        let msgs_a_before = query_messages(&c, chat_a_id).unwrap();
+        assert_eq!(msgs_a_before.len(), 1);
+        assert_eq!(
+            msgs_a_before[0].attachments.len(),
+            1,
+            "chat A has its attachment before deletion"
+        );
+
+        // --- ACT: delete chat A only ---
+        delete_chats_blocking(&mut c, &[chat_a_id]).unwrap();
+
+        // Chat A is gone; chat B remains.
+        let chats_after = query_chats(&c).unwrap();
+        assert_eq!(
+            chats_after.len(),
+            1,
+            "selected chat removed, the other remains"
+        );
+        assert!(
+            chats_after.iter().all(|ch| ch.id != chat_a_id),
+            "deleted chat A is not in the list"
+        );
+        assert!(
+            chats_after.iter().any(|ch| ch.id == chat_b_id),
+            "remaining chat B is preserved"
+        );
+
+        // Cascade: messages of chat A are gone.
+        let msgs_a_after = query_messages(&c, chat_a_id).unwrap();
+        assert!(
+            msgs_a_after.is_empty(),
+            "messages of deleted chat A cascaded out"
+        );
+
+        // Cascade: chat_participant rows of chat A are gone.
+        let cp_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM chat_participant WHERE chat_id = ?1",
+                params![chat_a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cp_count, 0,
+            "chat_participant rows of deleted chat cascaded"
+        );
+
+        // Cascade: attachments of chat A's message are gone.
+        let att_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM attachment a
+                 JOIN message m ON a.message_id = m.id
+                 WHERE m.chat_id = ?1",
+                params![chat_a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            att_count, 0,
+            "attachments of deleted chat cascaded"
+        );
+
+        // Orphan sweep: handle "alice" was only used by chat A (and its
+        // message, which is gone) — it must be swept.
+        let alice_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM handle WHERE address = 'mailto:alice@example.com'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alice_count, 0, "orphan handle alice swept");
+
+        // Preserved: handle "self" is still used by chat B's participants.
+        let self_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM handle WHERE address = 'mailto:chrispouliot@icloud.com'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            self_count, 1,
+            "self handle preserved (still in chat B)"
+        );
+
+        // Preserved: handle "bob" is still used by chat B (chat_participant
+        // and as message sender for both B1 and B2).
+        let bob_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM handle WHERE address = 'mailto:bob@example.com'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bob_count, 1, "bob handle preserved (still in chat B)");
+
+        // Remaining chat B's data is fully intact.
+        let msgs_b_after = query_messages(&c, chat_b_id).unwrap();
+        assert_eq!(
+            msgs_b_after.len(),
+            2,
+            "remaining chat B's two messages preserved"
+        );
+
+        // --- ACT: empty id input — no-op, succeeds ---
+        delete_chats_blocking(&mut c, &[]).unwrap();
+
+        // Nothing changed.
+        let chats_final = query_chats(&c).unwrap();
+        assert_eq!(
+            chats_final.len(),
+            1,
+            "empty delete did not remove anything"
+        );
+        assert!(
+            chats_final.iter().any(|ch| ch.id == chat_b_id),
+            "chat B still present after empty delete"
+        );
+        let msgs_b_final = query_messages(&c, chat_b_id).unwrap();
+        assert_eq!(
+            msgs_b_final.len(),
+            2,
+            "chat B's messages still intact after empty delete"
+        );
     }
 }

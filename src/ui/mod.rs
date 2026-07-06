@@ -215,6 +215,12 @@ row.entry image.edit-icon {
 .crop-viewport {
   border: 1px solid alpha(currentColor, 0.4);
 }
+/* Chat-list row in selection mode when its chat is selected. The accent
+   colour is visually distinct against both light and dark themes. */
+.chat-row-selected {
+  background-color: alpha(@accent_bg_color, 0.25);
+  border-left: 4px solid @accent_bg_color;
+}
 ";
 
 /// Regex that matches URLs at word boundaries.
@@ -421,6 +427,10 @@ struct Ui {
     /// notification has been sent for the current LoggedOut episode, reset
     /// back to false when Registered arrives.
     reg_notified: Rc<Cell<bool>>,
+    /// Selection mode state for the chat list. When `is_selecting()`, left-click
+    /// on a row toggles selection instead of opening the chat. Right-click shows
+    /// a context menu with Select/Delete actions.
+    chat_selection: Rc<RefCell<ChatSelectionState>>,
 }
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
@@ -704,6 +714,7 @@ pub fn enter_messaging(
         current_text: Rc::new(RefCell::new(std::collections::HashMap::new())),
         reg_banner: reg_banner.clone(),
         reg_notified: Rc::new(Cell::new(false)),
+        chat_selection: Rc::new(RefCell::new(ChatSelectionState::new())),
     };
 
     // Sync the compose bar visibility with the split view's content panel.
@@ -717,7 +728,7 @@ pub fn enter_messaging(
         });
     }
 
-    // Open a chat when its row is activated.
+    // Open a chat when its row is activated (or toggle selection in selection mode).
     {
         let ui = ui.clone();
         chat_list.connect_row_activated(move |_list, row| {
@@ -727,7 +738,18 @@ pub fn enter_messaging(
             }
             let chat = ui.chats.borrow().get(idx as usize).cloned();
             if let Some(chat) = chat {
-                ui.open_chat(&chat);
+                if ui.chat_selection.borrow().is_selecting() {
+                    // In selection mode, toggle this chat instead of opening it.
+                    ui.chat_selection.borrow_mut().toggle_chat(chat.id);
+                    // Update the row's visual selection state.
+                    if ui.chat_selection.borrow().is_selected(chat.id) {
+                        row.add_css_class("chat-row-selected");
+                    } else {
+                        row.remove_css_class("chat-row-selected");
+                    }
+                } else {
+                    ui.open_chat(&chat);
+                }
             }
         });
     }
@@ -1256,6 +1278,76 @@ impl Ui {
         *self.pending_attachment.borrow_mut() = None;
     }
 
+    /// Delete the currently selected chats (from the store only — no CloudKit
+    /// call). Clears selection, reloads the sidebar, and if the currently open
+    /// chat was among the deleted ones, clears the message view.
+    fn delete_selected_chats(&self) {
+        let ids: Vec<i64> = self.chat_selection.borrow().selected_chat_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let was_open_deleted = self
+            .open_summary
+            .borrow()
+            .as_ref()
+            .map(|s| ids.contains(&s.id))
+            .unwrap_or(false);
+        let store = self.store.clone();
+        let ui = self.clone();
+        gtk_bridge::spawn(
+            async move {
+                store.delete_chats(ids).await
+            },
+            move |result| {
+                if let Err(e) = result {
+                    log::error!("failed to delete chats: {e:#}");
+                    return;
+                }
+                ui.chat_selection.borrow_mut().clear();
+                if was_open_deleted {
+                    // Close the deleted chat: show the empty state.
+                    *ui.open_summary.borrow_mut() = None;
+                    ui.content_stack.set_visible_child_name("empty");
+                    ui.rename_button.set_sensitive(false);
+                    ui.compose_outer.set_visible(false);
+                    clear_box(&ui.msg_container);
+                }
+                ui.reload_chats(|_| {});
+            },
+        );
+    }
+
+    /// Delete a single chat (when not in selection mode).
+    fn delete_single_chat(&self, chat_id: i64) {
+        let store = self.store.clone();
+        let ui = self.clone();
+        let was_open = self
+            .open_summary
+            .borrow()
+            .as_ref()
+            .map(|s| s.id == chat_id)
+            .unwrap_or(false);
+        gtk_bridge::spawn(
+            async move {
+                store.delete_chats(vec![chat_id]).await
+            },
+            move |result| {
+                if let Err(e) = result {
+                    log::error!("failed to delete chat {chat_id}: {e:#}");
+                    return;
+                }
+                if was_open {
+                    *ui.open_summary.borrow_mut() = None;
+                    ui.content_stack.set_visible_child_name("empty");
+                    ui.rename_button.set_sensitive(false);
+                    ui.compose_outer.set_visible(false);
+                    clear_box(&ui.msg_container);
+                }
+                ui.reload_chats(|_| {});
+            },
+        );
+    }
+
     /// Inspect the default clipboard and, if it carries a file URI or a
     /// supported image mime, attach the first item via `set_pending_attachment`.
     /// Returns `Propagation::Stop` when we initiate an attach (so the entry's
@@ -1385,7 +1477,7 @@ impl Ui {
             on_chats(&chats);
             clear(&ui.chat_list);
             for c in &chats {
-                ui.chat_list.append(&chat_row(c, &ui.handles, &ui.contacts.borrow()));
+                ui.chat_list.append(&chat_row(&ui, c));
             }
             // Keep the open chat highlighted across refreshes.
             if let Some(open) = ui.open_summary.borrow().as_ref() {
@@ -2004,22 +2096,58 @@ impl Ui {
                     let backend = backend.clone();
                     let store = store.clone();
                     crate::runtime::runtime().spawn(async move {
-                        let password_prompt =
-                            build_password_prompt_closure(None);
-                        match crate::protocol::rustpush_backend::orchestrate_sync_now_flow(
-                            &*backend,
-                            &store,
-                            i64::MIN,
-                            true,
-                            password_prompt,
-                        )
-                        .await
-                        {
-                            Ok(result) => log::info!(
-                                "cloud sync toggle: setup + sync completed ({} messages)",
-                                result.messages_processed
-                            ),
-                            Err(e) => log::error!("cloud sync toggle: {e}"),
+                        // Check for viable escrow bottles to determine
+                        // whether to show a bottle-selection prompt.
+                        let bottles = backend.get_viable_escrow_bottles().await;
+                        match crate::protocol::decide_bottles_lookup_action(bottles) {
+                            crate::protocol::BottlesLookupAction::EstablishFirstTime => {
+                                // No viable bottles → first-time establish
+                                // path (old orchestrator).
+                                let password_prompt =
+                                    build_password_prompt_closure(None);
+                                match crate::protocol::rustpush_backend::orchestrate_sync_now_flow(
+                                    &*backend,
+                                    &store,
+                                    crate::sync::manual_sync_cutoff_ms(now_ms()),
+                                    true,
+                                    password_prompt,
+                                )
+                                .await
+                                {
+                                    Ok(result) => log::info!(
+                                        "cloud sync toggle: setup + sync completed ({} messages)",
+                                        result.messages_processed
+                                    ),
+                                    Err(e) => log::error!("cloud sync toggle: {e}"),
+                                }
+                            }
+                            crate::protocol::BottlesLookupAction::ShowBottleSelection(bottles) => {
+                                // Bottles exist → show selection dialog and
+                                // use the bottle-aware orchestrator.
+                                let prompt = build_bottle_aware_prompt_closure(None, bottles);
+                                match crate::protocol::rustpush_backend::orchestrate_sync_now_flow_with_bottle_prompt(
+                                    &*backend,
+                                    &store,
+                                    crate::sync::manual_sync_cutoff_ms(now_ms()),
+                                    true,
+                                    prompt,
+                                )
+                                .await
+                                {
+                                    Ok(result) => log::info!(
+                                        "cloud sync toggle: setup + sync completed ({} messages)",
+                                        result.messages_processed
+                                    ),
+                                    Err(e) => log::error!("cloud sync toggle: {e}"),
+                                }
+                            }
+                            crate::protocol::BottlesLookupAction::SurfaceError(reason) => {
+                                // Bottle lookup unavailable — log the error
+                                // and do NOT open the old establish prompt.
+                                log::error!(
+                                    "cloud sync toggle: bottle lookup unavailable: {reason}",
+                                );
+                            }
                         }
                     });
                 }
@@ -2057,7 +2185,7 @@ impl Ui {
                 let store = self.store.clone();
                 let status_label = sync_now_status.clone();
                 let button = sync_now_button.clone();
-                let window = self.window.clone();
+                let _window = self.window.clone();
                 sync_now_button.connect_clicked(move |btn| {
                     btn.set_sensitive(false);
                     status_label.set_text("Syncing…");
@@ -2065,28 +2193,53 @@ impl Ui {
                     let store = store.clone();
                     let status_label = status_label.clone();
                     let button = button.clone();
-                    // Pre-build the password prompt closure while on the GTK
-                    // main thread, so we can capture the parent window.
-                    let parent = window
-                        .borrow()
-                        .as_ref()
-                        .and_then(|w| w.downcast_ref::<adw::Window>().cloned());
-                    let password_prompt =
-                        build_password_prompt_closure(parent.as_ref());
                     // Run the orchestrator on the Tokio runtime (it touches
                     // hyper, which requires a reactor — `glib::spawn_future_local`
                     // doesn't provide one and would panic). Bridge the result
                     // back to the glib main thread for the UI update.
+                    // NOTE: both prompt closures discard their parent argument,
+                    // so we pass None here (capturing an adw::Window would make
+                    // the async block !Send).
                     let (tx, rx) = oneshot::channel();
                     crate::runtime::runtime().spawn(async move {
-                        let result = crate::protocol::rustpush_backend::orchestrate_sync_now_flow(
-                            &*backend,
-                            &store,
-                            i64::MIN,
-                            true,
-                            password_prompt,
-                        )
-                        .await;
+                        // Fetch viable bottles first to decide which path
+                        // to take (bottle-aware vs first-time establish vs
+                        // error — the pre-fix bug collapsed errors into the
+                        // establish path, showing the old two-textbox prompt).
+                        let bottles = backend.get_viable_escrow_bottles().await;
+                        let result = match crate::protocol::decide_bottles_lookup_action(bottles) {
+                            crate::protocol::BottlesLookupAction::EstablishFirstTime => {
+                                // No viable bottles → first-time establish path.
+                                let password_prompt =
+                                    build_password_prompt_closure(None);
+                                crate::protocol::rustpush_backend::orchestrate_sync_now_flow(
+                                    &*backend,
+                                    &store,
+                                    crate::sync::manual_sync_cutoff_ms(now_ms()),
+                                    true,
+                                    password_prompt,
+                                )
+                                .await
+                            }
+                            crate::protocol::BottlesLookupAction::ShowBottleSelection(bottles) => {
+                                // Bottles exist → show selection dialog and use
+                                // the bottle-aware orchestrator.
+                                let prompt = build_bottle_aware_prompt_closure(None, bottles);
+                                crate::protocol::rustpush_backend::orchestrate_sync_now_flow_with_bottle_prompt(
+                                    &*backend,
+                                    &store,
+                                    crate::sync::manual_sync_cutoff_ms(now_ms()),
+                                    true,
+                                    prompt,
+                                )
+                                .await
+                            }
+                            crate::protocol::BottlesLookupAction::SurfaceError(reason) => {
+                                // Bottle lookup unavailable — surface the error
+                                // via the Err path so the status label shows it.
+                                Err(reason)
+                            }
+                        };
                         let _ = tx.send(result);
                     });
                     glib::spawn_future_local(async move {
@@ -5533,11 +5686,15 @@ pub async fn apply_chat_edit(
     Ok(())
 }
 
-/// A sidebar row: avatar + chat name + unread badge.
-fn chat_row(c: &ChatSummary, handles: &[String], contacts: &[Contact]) -> gtk::ListBoxRow {
-    let title = chat_title(c, handles, contacts);
+/// A sidebar row: avatar + chat name + unread badge, with right-click context
+/// menu and long-press selection gesture.
+fn chat_row(ui: &Ui, c: &ChatSummary) -> gtk::ListBoxRow {
+    let title = chat_title(c, &ui.handles, &ui.contacts.borrow());
     let row = gtk::ListBoxRow::new();
     row.add_css_class("navigation-sidebar-row");
+    if ui.chat_selection.borrow().is_selected(c.id) {
+        row.add_css_class("chat-row-selected");
+    }
 
     let box_ = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -5556,7 +5713,7 @@ fn chat_row(c: &ChatSummary, handles: &[String], contacts: &[Contact]) -> gtk::L
         if let Some(texture) = load_texture(path) {
             avatar.set_custom_image(Some(&texture));
         }
-    } else if let Some(bytes) = crate::contacts::chat_avatar_bytes(c, handles, contacts) {
+    } else if let Some(bytes) = crate::contacts::chat_avatar_bytes(c, &ui.handles, &ui.contacts.borrow()) {
         if let Some(texture) = texture_from_bytes(bytes) {
             avatar.set_custom_image(Some(&texture));
         }
@@ -5578,6 +5735,95 @@ fn chat_row(c: &ChatSummary, handles: &[String], contacts: &[Contact]) -> gtk::L
     }
 
     row.set_child(Some(&box_));
+
+    // --- Right-click context menu ---
+    let gesture_right = gtk::GestureClick::new();
+    gesture_right.set_button(3);
+    let ui_rc = ui.clone();
+    let chat_id = c.id;
+    let row_for_popover = row.clone();
+    gesture_right.connect_released(move |_gesture, _n, _x, _y| {
+        let popover = gtk::Popover::builder()
+            .autohide(true)
+            .build();
+
+        let vbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .margin_start(4)
+            .margin_end(4)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+
+        let selecting = ui_rc.chat_selection.borrow().is_selecting();
+
+        if !selecting {
+            // "Select" — enter selection mode and select this chat.
+            let select_btn = gtk::Button::builder()
+                .label("Select")
+                .css_classes(["flat"])
+                .build();
+            let ui2 = ui_rc.clone();
+            let popover2 = popover.clone();
+            let row_for_sel = row_for_popover.clone();
+            select_btn.connect_clicked(move |_| {
+                ui2.chat_selection.borrow_mut().begin_select(chat_id);
+                row_for_sel.add_css_class("chat-row-selected");
+                popover2.popdown();
+            });
+            vbox.append(&select_btn);
+        }
+
+        // "Delete" (single when not selecting, all selected when selecting).
+        let delete_label = if selecting {
+            let count = ui_rc.chat_selection.borrow().selected_chat_ids().len();
+            format!("Delete ({} selected)", count)
+        } else {
+            "Delete".to_string()
+        };
+        let delete_btn = gtk::Button::builder()
+            .label(&delete_label)
+            .css_classes(["flat"])
+            .build();
+        let ui2 = ui_rc.clone();
+        let popover2 = popover.clone();
+        delete_btn.connect_clicked(move |_| {
+            if selecting {
+                ui2.delete_selected_chats();
+            } else {
+                ui2.delete_single_chat(chat_id);
+            }
+            popover2.popdown();
+        });
+        vbox.append(&delete_btn);
+
+        popover.set_child(Some(&vbox));
+        popover.set_parent(&row_for_popover);
+
+        // Unparent on close to avoid accumulating hidden children.
+        popover.connect_closed(|p| p.unparent());
+
+        popover.popup();
+    });
+    row.add_controller(gesture_right);
+
+    // --- Long-press → enter selection mode and select this chat ---
+    let long_press = gtk::GestureLongPress::builder()
+        .touch_only(false)
+        .build();
+    let ui_lp = ui.clone();
+    let lp_chat_id = c.id;
+    let row_lp = row.clone();
+    long_press.connect_pressed(move |_gesture, _x, _y| {
+        ui_lp
+            .chat_selection
+            .borrow_mut()
+            .begin_select_from_long_press(lp_chat_id);
+        row_lp.add_css_class("chat-row-selected");
+    });
+    row.add_controller(long_press);
+
     row
 }
 
@@ -8825,34 +9071,73 @@ mod avatar_save_tests {
     }
 }
 
-/// Build an `adw::AlertDialog` for prompting the user for their iCloud
-/// account password (the "device password" used by
-/// `Backend::setup_keychain_clique`). The dialog is pre-populated with
-/// the expected title, body, and a password entry. The caller is
-/// responsible for presenting the dialog (`dialog.present(Some(parent))`)
-/// and wiring the response handling.
+/// Build an `adw::AlertDialog` for prompting the user for both the old
+/// trusted-device passcode (to recover the existing escrow bottle) and the
+/// new local device password (to protect this device's new bottle). Both
+/// are needed for [`Backend::setup_keychain_clique`]. The dialog is
+/// pre-populated with the expected title, body, and two password entries.
+/// The caller is responsible for presenting the dialog
+/// (`dialog.present(Some(parent))`) and wiring the response handling.
 ///
 /// The dialog has:
-/// - Title: "iCloud Account Password"
-/// - Body: "Enter your iCloud account password to set up iCloud Keychain
-///   on this device. This is required to sync iMessage history from
-///   iCloud."
-/// - A password entry widget (`gtk::PasswordEntry`)
+/// - Title: "iCloud Keychain Setup"
+/// - Body: "Enter the passcode from a trusted device to unlock your iCloud
+///   Keychain, then choose a new password for this device."
+/// - A "Trusted Device Passcode" entry (`gtk::PasswordEntry`)
+/// - A "New Device Password" entry (`gtk::PasswordEntry`)
 /// - "Cancel" button (response id: "cancel")
 /// - "Set Up" button (response id: "suggested", default appearance)
 #[allow(dead_code)]
-pub fn build_clique_password_dialog(_parent: Option<&adw::Window>) -> adw::AlertDialog {
-    let dialog = adw::AlertDialog::new(
-        Some("iCloud Account Password"),
-        Some("Enter your iCloud account password to set up iCloud Keychain on this device. This is required to sync iMessage history from iCloud."),
-    );
+pub fn build_clique_password_dialog(
+    _parent: Option<&adw::Window>,
+    bottle_descriptions: &[String],
+) -> adw::AlertDialog {
+    let subtitle: &str = if bottle_descriptions.is_empty() {
+        "Set up iCloud Keychain for this device. Choose a device password to protect your keychain."
+    } else {
+        "Select a device to recover from, then enter its passcode and a new password for this device."
+    };
+    let dialog = adw::AlertDialog::new(Some("iCloud Keychain Setup"), Some(subtitle));
 
-    let password_entry = gtk::PasswordEntry::builder()
+    let box_ = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+
+    // Bottle selection dropdown (shown when there are viable bottles).
+    if !bottle_descriptions.is_empty() {
+        let label = gtk::Label::new(Some("Recover from device:"));
+        label.set_halign(gtk::Align::Start);
+        label.add_css_class("heading");
+        box_.append(&label);
+
+        // Build a StringList from the descriptions. StringList::new takes &[&str].
+        let desc_refs: Vec<&str> = bottle_descriptions.iter().map(|s| s.as_str()).collect();
+        let model = gtk::StringList::new(&desc_refs);
+        let dropdown = gtk::DropDown::builder()
+            .model(&model)
+            .selected(0u32)
+            .hexpand(true)
+            .build();
+        box_.append(&dropdown);
+    }
+
+    // Passcode for recovering the selected escrow bottle.
+    let escrow_entry = gtk::PasswordEntry::builder()
         .show_peek_icon(true)
         .build();
-    password_entry.set_placeholder_text(Some("Password"));
+    escrow_entry.set_placeholder_text(Some("Trusted Device Passcode"));
 
-    dialog.set_extra_child(Some(&password_entry));
+    // New password for THIS device's bottle.
+    let device_entry = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .build();
+    device_entry.set_placeholder_text(Some("New Device Password"));
+
+    box_.append(&escrow_entry);
+    box_.append(&device_entry);
+
+    dialog.set_extra_child(Some(&box_));
     dialog.add_responses(&[("cancel", "Cancel"), ("suggested", "Set Up")]);
     dialog.set_response_appearance("suggested", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("suggested"));
@@ -8863,8 +9148,10 @@ pub fn build_clique_password_dialog(_parent: Option<&adw::Window>) -> adw::Alert
 
 /// Build a closure suitable for the `password_prompt` parameter of
 /// `orchestrate_sync_now_flow`. The closure, when called, presents the
-/// iCloud Keychain password dialog, waits for the user's response, and
-/// returns the entered password (or `None` if the user cancelled).
+/// iCloud Keychain setup dialog (with fields for both the old trusted-device
+/// passcode and the new local device password), waits for the user's response,
+/// and returns `Some((escrow_passcode, device_password))` on submit, or
+/// `None` if the user cancelled.
 ///
 /// `parent` is the parent window the dialog should be modal to.
 ///
@@ -8889,12 +9176,12 @@ pub fn build_clique_password_dialog(_parent: Option<&adw::Window>) -> adw::Alert
 #[allow(dead_code)]
 pub fn build_password_prompt_closure(
     _parent: Option<&adw::Window>,
-) -> impl FnOnce() -> Option<String> {
+) -> impl FnOnce() -> Option<(String, String)> {
     // Discard the parent reference to avoid capturing a non-Send type.
     // The dialog is presented without an explicit parent window.
     let _ = _parent;
     move || {
-        let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<(String, String)>>();
         // `glib::MainContext::default().invoke(...)` is the cross-thread way
         // to run GTK code from a tokio worker. It posts a sync closure to
         // the main context and blocks the calling thread until the main
@@ -8903,22 +9190,42 @@ pub fn build_password_prompt_closure(
         // The user response comes later via the dialog's response signal,
         // which the main thread drives through its main loop while our
         // tokio thread blocks on `rx.blocking_recv()`.
+        let empty_descriptions: Vec<String> = Vec::new();
         glib::MainContext::default().invoke(move || {
-            let dialog = build_clique_password_dialog(None);
+            let dialog = build_clique_password_dialog(None, &empty_descriptions);
             // Wrap `tx` in a `RefCell<Option<...>>` so it can be taken
             // once inside an `Fn` closure (signal handlers are `Fn`).
             let tx = std::cell::RefCell::new(Some(tx));
             dialog.connect_response(None, move |dialog, response_id| {
-                let password = if response_id == "suggested" {
+                let secrets = if response_id == "suggested" {
+                    // The extra child is a GtkBox containing two PasswordEntry widgets.
                     dialog
                         .extra_child()
-                        .and_downcast::<gtk::PasswordEntry>()
-                        .map(|entry| entry.text().to_string())
+                        .and_downcast::<gtk::Box>()
+                        .map(|box_| {
+                            let children = box_.observe_children();
+                            // When no bottle descriptions exist, the box has
+                            // exactly two children, both PasswordEntry widgets
+                            // (indices 0 and 1). When descriptions exist, a
+                            // Label and DropDown precede them.
+                            let entries: Vec<gtk::PasswordEntry> = (0..children.n_items())
+                                .filter_map(|i| children.item(i).and_downcast::<gtk::PasswordEntry>())
+                                .collect();
+                            let escrow = entries
+                                .first()
+                                .map(|e| e.text().to_string())
+                                .unwrap_or_default();
+                            let device = entries
+                                .get(1)
+                                .map(|e| e.text().to_string())
+                                .unwrap_or_default();
+                            (escrow, device)
+                        })
                 } else {
                     None
                 };
                 if let Some(tx) = tx.borrow_mut().take() {
-                    let _ = tx.send(password);
+                    let _ = tx.send(secrets);
                 }
             });
             dialog.present(None::<&gtk::Window>);
@@ -8927,28 +9234,537 @@ pub fn build_password_prompt_closure(
     }
 }
 
+/// Build a closure suitable for the `prompt` parameter of
+/// `orchestrate_sync_now_flow_with_bottle_prompt`. Like
+/// [`build_password_prompt_closure`] but the dialog also shows a
+/// bottle-selection dropdown when `bottles` is non-empty, and the
+/// returned closure yields [`CliqueSetupPromptResult`] which carries
+/// the selected `EscrowData` plus both secrets.
+///
+/// When `bottles` is empty the dialog shows only the two password
+/// fields (first-time establish path), but still returns a
+/// `CliqueSetupPromptResult` with a default bottle — the calling
+/// orchestrator should fall back to `setup_keychain_clique` in that
+/// case.
+///
+/// # Thread safety
+///
+/// Same contract as [`build_password_prompt_closure`]: the returned
+/// closure is `Send` and uses `glib::MainContext::invoke` to schedule
+/// GTK work on the main thread.
+pub fn build_bottle_aware_prompt_closure(
+    _parent: Option<&adw::Window>,
+    bottles: Vec<(crate::api::EscrowData, String)>,
+) -> impl FnOnce() -> Option<crate::protocol::rustpush_backend::CliqueSetupPromptResult> {
+    let _ = _parent;
+    move || {
+        let (tx, rx) = tokio::sync::oneshot::channel::<
+            Option<crate::protocol::rustpush_backend::CliqueSetupPromptResult>,
+        >();
+        // The bottles are shared between the GTK invoke closure and the
+        // response handler via an Arc.
+        let bottles = std::sync::Arc::new(bottles);
+        let descriptions: Vec<String> = bottles.iter().map(|(_, desc)| desc.clone()).collect();
+
+        glib::MainContext::default().invoke(move || {
+            let dialog = build_clique_password_dialog(None, &descriptions);
+            let tx = std::cell::RefCell::new(Some(tx));
+            let bottles = bottles.clone();
+            dialog.connect_response(None, move |dialog, response_id| {
+                let result = if response_id == "suggested" {
+                    // 1. Read the selected bottle index from the DropDown (if any).
+                    let selected_idx: usize = dialog
+                        .extra_child()
+                        .and_downcast::<gtk::Box>()
+                        .and_then(|box_| {
+                            let children = box_.observe_children();
+                            (0..children.n_items())
+                                .filter_map(|i| children.item(i).and_downcast::<gtk::DropDown>())
+                                .next()
+                                .map(|dd| dd.selected() as usize)
+                        })
+                        .unwrap_or(0);
+
+                    // 2. Read the password fields (by type, ignore label/dropdown).
+                    let secrets: Option<(String, String)> = dialog
+                        .extra_child()
+                        .and_downcast::<gtk::Box>()
+                        .map(|box_| {
+                            let children = box_.observe_children();
+                            let entries: Vec<gtk::PasswordEntry> = (0..children.n_items())
+                                .filter_map(|i| children.item(i).and_downcast::<gtk::PasswordEntry>())
+                                .collect();
+                            let escrow = entries
+                                .first()
+                                .map(|e| e.text().to_string())
+                                .unwrap_or_default();
+                            let device = entries
+                                .get(1)
+                                .map(|e| e.text().to_string())
+                                .unwrap_or_default();
+                            (escrow, device)
+                        });
+
+                    // 3. Build the prompt result when we have both secrets.
+                    secrets.map(|(old, new)| {
+                        let bottle = bottles[selected_idx.min(bottles.len().saturating_sub(1))]
+                            .0
+                            .clone();
+                        crate::protocol::rustpush_backend::CliqueSetupPromptResult {
+                            bottle,
+                            old_passcode: old,
+                            new_password: new,
+                        }
+                    })
+                } else {
+                    None
+                };
+                if let Some(tx) = tx.borrow_mut().take() {
+                    let _ = tx.send(result);
+                }
+            });
+            dialog.present(None::<&gtk::Window>);
+        });
+        rx.blocking_recv().ok().flatten()
+    }
+}
+
+/// Pure display helper: turn [`rustpush::keychain::EscrowMetadata`] into
+/// user-facing text containing enough information to know which device
+/// credential to enter.
+///
+/// The output includes:
+///   * device name OR model (so the user knows which device's passcode to
+///     type), with the serial as a fallback if both name and model are absent;
+///   * timestamp (so the user can disambiguate between multiple devices with
+///     the same name);
+///   * passcode type hints — specifically, a numeric passcode length when
+///     `SecureBackupUsesNumericPassphrase` is set in the bottle's
+///     `ClientMetadata`, so the user knows how many digits to type.
+///
+/// This is a pure function (no I/O, no GTK, no global state) so it can be
+/// unit-tested without a display.
+#[allow(dead_code)]
+pub fn describe_escrow_metadata_for_user(meta: &rustpush::keychain::EscrowMetadata) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Device identity: prefer device name, fall back to model, then serial.
+    let dict = meta.client_metadata.as_dictionary();
+    let device_name = dict
+        .and_then(|d| d.get("device_name"))
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string());
+    let device_model = dict
+        .and_then(|d| d.get("device_model"))
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string());
+
+    // Device identity: show name + model (when both available), or whichever
+    // is present, or the serial as last resort.
+    match (&device_name, &device_model) {
+        (Some(name), Some(model)) => {
+            parts.push(name.clone());
+            parts.push(model.clone());
+        }
+        (Some(name), None) => parts.push(name.clone()),
+        (None, Some(model)) => parts.push(model.clone()),
+        (None, None) => parts.push(meta.serial.clone()),
+    }
+
+    // Timestamp (allows disambiguation between multiple bottles).
+    parts.push(meta.timestamp.clone());
+
+    // Passcode type hint.
+    let numeric_len = dict
+        .and_then(|d| d.get("SecureBackupUsesNumericPassphrase"))
+        .and_then(|v| v.as_boolean())
+        .filter(|&b| b)
+        .and_then(|_| dict.and_then(|d| d.get("SecureBackupNumericPassphraseLength")))
+        .and_then(|v| v.as_signed_integer());
+    let is_complex = dict
+        .and_then(|d| d.get("SecureBackupUsesComplexPassphrase"))
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+
+    if let Some(len) = numeric_len {
+        parts.push(format!("{len}-digit numeric passcode"));
+    } else if is_complex {
+        parts.push("complex passphrase".to_string());
+    } else {
+        parts.push("passcode".to_string());
+    }
+
+    parts.join(" — ")
+}
+
 #[cfg(test)]
 mod clique_password_dialog_tests {
     use super::*;
 
     /// Compile-time signature check: `build_clique_password_dialog` must exist
-    /// with the expected signature. GTK widget instantiation requires a display,
-    /// so this test only verifies the function is callable with the right types.
+    /// with the expected signature (now takes bottle descriptions). GTK widget
+    /// instantiation requires a display, so this test only verifies the function
+    /// is callable with the right types.
     #[test]
     fn build_clique_password_dialog_exists() {
-        let _: fn(Option<&adw::Window>) -> adw::AlertDialog = build_clique_password_dialog;
+        let _: fn(Option<&adw::Window>, &[String]) -> adw::AlertDialog = build_clique_password_dialog;
     }
 
     /// Compile-time signature check: `build_password_prompt_closure` must exist
     /// with the expected signature. GTK dialog interaction requires a display,
     /// so this test only verifies the function is callable with the right types
-    /// and returns a closure matching the `FnOnce() -> Option<String>` contract
-    /// required by `orchestrate_sync_now_flow`.
+    /// and returns a closure matching the `FnOnce() -> Option<(String, String)>`
+    /// contract required by `orchestrate_sync_now_flow`.
     #[test]
     fn build_password_prompt_closure_exists() {
-        fn _assert_prompt_type(_: impl FnOnce() -> Option<String>) {}
+        fn _assert_prompt_type(_: impl FnOnce() -> Option<(String, String)>) {}
         let closure = build_password_prompt_closure(None);
         _assert_prompt_type(closure);
+    }
+}
+
+#[cfg(test)]
+mod clique_escrow_metadata_display_tests {
+    //! Pin: the UI/prompt layer must expose a pure display helper that
+    //! turns `rustpush::keychain::EscrowMetadata` into user-facing text
+    //! containing enough information to know which device credential to
+    //! enter. Required fields:
+    //!
+    //!   * device name OR model (so the user knows which device's
+    //!     passcode to type), with the serial as a fallback if both
+    //!     name and model are absent;
+    //!   * timestamp (so the user can disambiguate between multiple
+    //!     devices with the same name);
+    //!   * passcode type hints — specifically, a numeric passcode
+    //!     length when `SecureBackupUsesNumericPassphrase` is set in
+    //!     the bottle's `ClientMetadata`, so the user knows how many
+    //!     digits to type.
+    //!
+    //! The helper is pure (no I/O, no GTK, no global state) so it can
+    //! be unit-tested without a display — exactly the surface the unit
+    //! spec calls out.
+    //!
+    //! This test fails to compile until the pure helper
+    //! `describe_escrow_metadata_for_user(&EscrowMetadata) -> String`
+    //! is added to this module. The compile error is the expected red
+    //! per the unit's spec (the seam is the deliverable, not a fake
+    //! stub).
+
+    /// Pin: when the bottle's `ClientMetadata` includes a device name,
+    /// a device model, a timestamp, and a numeric passcode length, the
+    /// display text must surface all of them so the user can match the
+    /// credential entry to a specific device.
+    #[test]
+    fn describe_escrow_metadata_for_user_includes_device_identity_timestamp_and_passcode_hints() {
+        use rustpush::keychain::EscrowMetadata;
+
+        let mut client_meta = plist::Dictionary::new();
+        client_meta.insert(
+            "device_name".into(),
+            plist::Value::String("Alice's iPhone".into()),
+        );
+        client_meta.insert(
+            "device_model".into(),
+            plist::Value::String("iPhone15,2".into()),
+        );
+        client_meta.insert(
+            "SecureBackupUsesNumericPassphrase".into(),
+            plist::Value::Boolean(true),
+        );
+        client_meta.insert(
+            "SecureBackupNumericPassphraseLength".into(),
+            plist::Value::Integer(6.into()),
+        );
+
+        let meta = EscrowMetadata {
+            serial: "F2LXY9J7Q6L7".into(),
+            build: "23A340".into(),
+            passcode_generation: 2,
+            timestamp: "2026-04-01T12:34:56Z".into(),
+            bottle_id: "B-1234".into(),
+            client_metadata: plist::Value::Dictionary(client_meta),
+            escrowed_spki: plist::Data::new(Vec::new()),
+            multiple_icsc: false,
+        };
+
+        // The pure helper must exist with this exact signature. Pre-fix
+        // code has no such helper, so this call fails to compile —
+        // the expected red per the unit's spec.
+        let text = super::describe_escrow_metadata_for_user(&meta);
+
+        // Device identity: the user must be able to identify the device.
+        assert!(
+            text.contains("Alice's iPhone"),
+            "display text must include device_name from ClientMetadata so the user \
+             knows which device to enter a passcode for; got: {text}"
+        );
+        assert!(
+            text.contains("iPhone15,2"),
+            "display text must include device_model from ClientMetadata so the user \
+             can disambiguate devices with the same name; got: {text}"
+        );
+
+        // Timestamp: lets the user pick the right device when there
+        // are multiple bottles from the same device name (e.g. an
+        // iPhone and an iPad both named "Alice's iPhone").
+        assert!(
+            text.contains("2026-04-01"),
+            "display text must include the bottle's timestamp so the user can \
+             disambiguate between multiple bottles; got: {text}"
+        );
+
+        // Passcode type hint: numeric length tells the user how many
+        // digits to type. A generic phrase like "passcode" without a
+        // length is insufficient — the user needs to know
+        // "enter a 6-digit numeric passcode" vs "enter your passcode".
+        assert!(
+            text.contains('6'),
+            "display text must include the numeric passcode length (6) from \
+             ClientMetadata so the user knows how many digits to type; got: {text}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat-list selection-state helper — pure state, no GTK wiring.
+// ---------------------------------------------------------------------------
+
+/// Tracks whether the chat list is in "selecting" mode and which chat ids are
+/// currently selected. No widget code, no I/O, no global state.
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct ChatSelectionState {
+    /// Whether the list is in selection mode (shown by checkboxes on rows).
+    selecting: bool,
+    /// Set of chat ids the user has toggled into the selection.
+    selected: HashSet<i64>,
+}
+
+#[allow(dead_code)]
+impl ChatSelectionState {
+    /// Create a fresh state: not selecting, no selected chats.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if the list is in selecting mode.
+    pub(crate) fn is_selecting(&self) -> bool {
+        self.selecting
+    }
+
+    /// Returns `true` if the given chat is currently selected.
+    pub(crate) fn is_selected(&self, chat_id: i64) -> bool {
+        self.selected.contains(&chat_id)
+    }
+
+    /// Returns a snapshot of the currently selected chat ids.
+    pub(crate) fn selected_chat_ids(&self) -> Vec<i64> {
+        self.selected.iter().copied().collect()
+    }
+
+    /// Enter selecting mode and select the given chat.
+    pub(crate) fn begin_select(&mut self, chat_id: i64) {
+        self.selecting = true;
+        self.selected.insert(chat_id);
+    }
+
+    /// Enter selecting mode from a long-press (same effect as `begin_select`).
+    pub(crate) fn begin_select_from_long_press(&mut self, chat_id: i64) {
+        self.selecting = true;
+        self.selected.insert(chat_id);
+    }
+
+    /// While selecting, toggle the given chat in/out of the selected set.
+    /// If the chat is already selected, it is removed; otherwise it is added.
+    pub(crate) fn toggle_chat(&mut self, chat_id: i64) {
+        if self.selected.contains(&chat_id) {
+            self.selected.remove(&chat_id);
+            if self.selected.is_empty() {
+                self.selecting = false;
+            }
+        } else {
+            self.selected.insert(chat_id);
+        }
+    }
+
+    /// Exit selecting mode and clear all selected chats.
+    pub(crate) fn clear(&mut self) {
+        self.selecting = false;
+        self.selected.clear();
+    }
+}
+
+#[cfg(test)]
+mod chat_selection_tests {
+    //! Pin the chat-list selection-state helper contract.
+    //!
+    //! The chat list's right-click "Select" menu item, long-press gesture, and
+    //! left-click wiring all share a small piece of pure state: whether the
+    //! list is in "selecting" mode and which chat ids are currently in the
+    //! selection set. This module pins that state machine so the GTK wiring
+    //! can be built against a pure, testable seam — no widget code, no I/O,
+    //! no global state.
+    //!
+    //! Contract (mirrors the unit spec):
+    //!
+    //! * Initial state: not selecting, no selected chats.
+    //! * Choosing `Select` on a chat enters selecting mode and selects it.
+    //! * Long-pressing a chat has the same effect as `Select`.
+    //! * While selecting, left-clicking a chat toggles it in/out of the set.
+    //! * Deleting targets every currently selected chat id.
+    //! * Clearing/exiting selection leaves: not selecting, no selected chats.
+    //!
+    //! The expected red is a compile error: the helper
+    //! `super::ChatSelectionState` (with the methods used below) does not
+    //! exist yet — adding it is the unit's deliverable. Each test constructs
+    //! its own fresh helper, so no test depends on the order of execution or
+    //! any shared mutable state.
+
+    use super::*;
+
+    #[test]
+    fn initial_state_is_not_selecting_with_no_selected_chats() {
+        let s = ChatSelectionState::new();
+        assert!(
+            !s.is_selecting(),
+            "fresh state must not be in selecting mode"
+        );
+        assert!(
+            s.selected_chat_ids().is_empty(),
+            "fresh state must have no selected chats"
+        );
+    }
+
+    #[test]
+    fn choosing_select_enters_selecting_mode_and_selects_that_chat() {
+        let mut s = ChatSelectionState::new();
+        s.begin_select(7);
+        assert!(s.is_selecting(), "Select must enter selecting mode");
+        assert!(
+            s.is_selected(7),
+            "Select must mark the chosen chat as selected"
+        );
+        assert_eq!(s.selected_chat_ids(), vec![7]);
+    }
+
+    #[test]
+    fn long_press_has_the_same_effect_as_select() {
+        let mut s = ChatSelectionState::new();
+        s.begin_select_from_long_press(42);
+        assert!(
+            s.is_selecting(),
+            "long-press must enter selecting mode (same as Select)"
+        );
+        assert!(
+            s.is_selected(42),
+            "long-press must select the pressed chat"
+        );
+        assert_eq!(s.selected_chat_ids(), vec![42]);
+    }
+
+    #[test]
+    fn left_click_while_selecting_toggles_another_chat_into_the_set() {
+        let mut s = ChatSelectionState::new();
+        s.begin_select(1);
+        s.toggle_chat(2);
+        assert!(s.is_selected(1), "originally selected chat stays selected");
+        assert!(
+            s.is_selected(2),
+            "left-click on a new chat adds it to the selected set"
+        );
+        assert_eq!(s.selected_chat_ids().len(), 2);
+    }
+
+    #[test]
+    fn left_click_while_selecting_toggles_an_already_selected_chat_out() {
+        let mut s = ChatSelectionState::new();
+        s.begin_select(1);
+        s.toggle_chat(2);
+        s.toggle_chat(2);
+        assert!(s.is_selected(1));
+        assert!(
+            !s.is_selected(2),
+            "left-click on an already-selected chat must remove it"
+        );
+        assert_eq!(s.selected_chat_ids(), vec![1]);
+    }
+
+    #[test]
+    fn unselecting_the_only_selected_chat_exits_selecting_mode() {
+        // Pin: after entering selection mode and then toggling the only
+        // selected chat off, the list must drop out of selecting mode and
+        // report an empty selection. Without this, the right-click menu
+        // shows "Delete (0 selected)" / "Delete 0" because the UI still
+        // believes it is in selection mode with nothing selected.
+        let mut s = ChatSelectionState::new();
+        s.begin_select(7);
+        s.toggle_chat(7);
+        assert!(
+            !s.is_selecting(),
+            "toggling the only selected chat off must exit selecting mode"
+        );
+        assert!(
+            s.selected_chat_ids().is_empty(),
+            "toggling the only selected chat off must leave the selected set empty"
+        );
+    }
+
+    #[test]
+    fn unselecting_the_final_chat_in_multi_select_exits_selecting_mode() {
+        // Pin the multi-select case: with two chats selected, toggling one
+        // off must keep selecting mode (another chat is still selected),
+        // but toggling the final one off must drop out of selecting mode.
+        let mut s = ChatSelectionState::new();
+        s.begin_select(1);
+        s.toggle_chat(2);
+        s.toggle_chat(1);
+        assert!(
+            s.is_selecting(),
+            "with another chat still selected, toggling one off must keep selecting mode"
+        );
+        assert_eq!(
+            s.selected_chat_ids(),
+            vec![2],
+            "after toggling one of two selected chats off, exactly the other remains"
+        );
+        s.toggle_chat(2);
+        assert!(
+            !s.is_selecting(),
+            "toggling the final selected chat off must exit selecting mode"
+        );
+        assert!(
+            s.selected_chat_ids().is_empty(),
+            "toggling the final selected chat off must leave the selected set empty"
+        );
+    }
+
+    #[test]
+    fn delete_targets_all_currently_selected_chat_ids() {
+        let mut s = ChatSelectionState::new();
+        s.begin_select(1);
+        s.toggle_chat(2);
+        s.toggle_chat(3);
+        // Iteration order is an implementation choice; what the contract
+        // pins is that the delete path iterates over exactly the full
+        // selected set.
+        let mut targets = s.selected_chat_ids();
+        targets.sort();
+        assert_eq!(targets, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn clear_leaves_not_selecting_with_no_selected_chats() {
+        let mut s = ChatSelectionState::new();
+        s.begin_select(1);
+        s.toggle_chat(2);
+        s.clear();
+        assert!(!s.is_selecting(), "clear must exit selecting mode");
+        assert!(
+            s.selected_chat_ids().is_empty(),
+            "clear must drop every selected chat"
+        );
+        assert!(!s.is_selected(1), "clear must forget every prior selection");
+        assert!(!s.is_selected(2), "clear must forget every prior selection");
     }
 }
 

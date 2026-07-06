@@ -312,10 +312,20 @@ pub fn registration_status_from(state: &rustpush::ResourceState) -> Registration
         rustpush::ResourceState::Failed(failure) => {
             let error = failure.error.to_string();
             match failure.retry_wait {
-                Some(retry_in_s) => RegistrationStatus::TransientFailure {
-                    retry_in_s,
-                    error,
-                },
+                Some(retry_in_s) => {
+                    // IDS 6005 "bad authentication" failures are permanent
+                    // auth errors — a passive retry loop will never recover.
+                    // Surface them as LoggedOut (re-auth required) even when
+                    // the resource manager suggests a retry_wait backoff.
+                    if is_6005_error(&failure.error) {
+                        RegistrationStatus::LoggedOut { error }
+                    } else {
+                        RegistrationStatus::TransientFailure {
+                            retry_in_s,
+                            error,
+                        }
+                    }
+                }
                 None => RegistrationStatus::LoggedOut { error },
             }
         }
@@ -882,14 +892,40 @@ impl Backend for RustpushBackend {
 
         // Spawn the identity resource state watcher. Subscribes to the resource
         // manager's watch channel, sends one initial event, then forwards every
-        // change to the UI via `notify`. Exits when the watch channel closes
-        // (resource manager dropped).
+        // change to the UI via `notify`. Also guards against spammy 6005 retry-now
+        // calls at launch: the first 6005 fires `identity.refresh_now()` immediately,
+        // subsequent 6005s within the cooldown are suppressed, and the cooldown
+        // resets on a successful `Generated` state. Exits when the watch channel
+        // closes (resource manager dropped).
         crate::runtime::runtime().spawn(async move {
             let mut rx = imclient_for_watch.identity.resource_state.subscribe();
+            let mut guard = Launch6005RetryGuard::new(std::time::Duration::from_secs(60));
             // Send initial state immediately so the UI reflects reality at startup.
             // Clone the value to drop the borrow before the await (the Ref is
             // not Send and cannot cross the await boundary).
             let initial = rx.borrow_and_update().clone();
+            // Evaluate initial state through the guard (fires refresh_now on first
+            // 6005, or resets on Generated, but doesn't block the UI notification).
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if guard.evaluate(&initial, now_secs) {
+                // Guard allows a 6005 retry-now — fire `refresh_now()`
+                // asynchronously. This is a best-effort self-heal; we don't
+                // block the UI notification on it.
+                let imc = imclient_for_watch.clone();
+                crate::runtime::runtime().spawn(async move {
+                    match imc.identity.refresh_now().await {
+                        Ok(()) => log::info!(
+                            "6005 retry-now: identity.refresh_now() succeeded"
+                        ),
+                        Err(e) => log::warn!(
+                            "6005 retry-now: identity.refresh_now() failed: {e:?}"
+                        ),
+                    }
+                });
+            }
             let _ = notify_for_watch
                 .send(RecvEvent::Registration(registration_status_from(&initial)))
                 .await;
@@ -899,6 +935,26 @@ impl Backend for RustpushBackend {
                     break;
                 }
                 let s = rx.borrow_and_update().clone();
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if guard.evaluate(&s, now_secs) {
+                    // Guard allows a 6005 retry-now — fire `refresh_now()`
+                    // asynchronously. This is a best-effort self-heal; we don't
+                    // block the UI notification on it.
+                    let imc = imclient_for_watch.clone();
+                    crate::runtime::runtime().spawn(async move {
+                        match imc.identity.refresh_now().await {
+                            Ok(()) => log::info!(
+                                "6005 retry-now: identity.refresh_now() succeeded"
+                            ),
+                            Err(e) => log::warn!(
+                                "6005 retry-now: identity.refresh_now() failed: {e:?}"
+                            ),
+                        }
+                    });
+                }
                 let _ = notify_for_watch
                     .send(RecvEvent::Registration(registration_status_from(&s)))
                     .await;
@@ -1384,7 +1440,8 @@ impl Backend for RustpushBackend {
 
     async fn setup_keychain_clique(
         &self,
-        password: &str,
+        escrow_passcode: &str,
+        device_password: &str,
     ) -> std::result::Result<(), String> {
         let dir = std::path::PathBuf::from(&self.state_path);
 
@@ -1479,23 +1536,44 @@ impl Backend for RustpushBackend {
             return Ok(());
         }
 
-        // Create a new keychain identity.
-        let identity = keychain
-            .new_user_identity(false)
+        // Discover viable escrow bottles to decide the setup route.
+        let bottles = keychain
+            .get_viable_bottles()
             .await
-            .map_err(|e| format!("create identity: {e:?}"))?;
+            .map_err(|e| format!("get viable bottles: {e:?}"))?;
 
-        // Join the clique with the device password.
-        keychain
-            .join_clique(
-                password.as_bytes(),
-                &identity,
-                None,
-                &[],
-                vec![],
-            )
-            .await
-            .map_err(|e| format!("join clique: {e:?}"))?;
+        match select_clique_setup_route(&bottles, 0) {
+            CliqueSetupRoute::JoinFromEscrow { bottle_index } => {
+                // Existing clique detected — recover the peer from escrow
+                // and join via voucher (calls Cuttlefish joinWithVoucher).
+                // `escrow_passcode` decrypts the existing bottle; `device_password`
+                // becomes this device's new bottle password.
+                let (bottle, _) = &bottles[bottle_index];
+                keychain
+                    .join_clique_from_escrow(
+                        bottle,
+                        escrow_passcode.as_bytes(),
+                        device_password.as_bytes(),
+                    )
+                    .await
+                    .map_err(|e| format!("join clique from escrow: {e:?}"))?;
+            }
+            CliqueSetupRoute::Establish => {
+                // First-time setup — create a new identity and establish a
+                // brand-new clique (calls Cuttlefish establish).
+                // Only `device_password` is relevant here; there is no existing
+                // escrow bottle to decrypt.
+                let identity = keychain
+                    .new_user_identity(false)
+                    .await
+                    .map_err(|e| format!("create identity: {e:?}"))?;
+
+                keychain
+                    .join_clique(device_password.as_bytes(), &identity, None, &[], vec![])
+                    .await
+                    .map_err(|e| format!("join clique: {e:?}"))?;
+            }
+        }
 
         Ok(())
     }
@@ -1508,6 +1586,255 @@ impl Backend for RustpushBackend {
         };
         dict.contains_key("user_identity")
     }
+
+    async fn setup_keychain_clique_with_bottle(
+        &self,
+        selected_bottle: &crate::api::EscrowData,
+        escrow_passcode: &str,
+        device_password: &str,
+    ) -> std::result::Result<(), String> {
+        let dir = std::path::PathBuf::from(&self.state_path);
+
+        // If the in-memory session isn't populated yet, reconstruct it
+        // from gsa.plist first.
+        if self.account.lock().unwrap().is_none()
+            && self.reconstruct_account(true).await.is_err()
+        {
+            return Err("account not reconstructed: sign in first".to_string());
+        }
+
+        let account = self.account.lock().unwrap().clone();
+        let anisette = self.anisette.lock().unwrap().clone();
+        let config = self.config.lock().unwrap().clone();
+        let (account, anisette, config) = match (account, anisette, config) {
+            (Some(a), Some(an), Some(c)) => (a, an, c),
+            _ => {
+                return Err(
+                    "account not reconstructed: sign in first".to_string(),
+                );
+            }
+        };
+
+        let config_arc: Arc<dyn OSConfig> = match &config {
+            api::JoinedOSConfig::MacOS(conf) => conf.clone(),
+            api::JoinedOSConfig::Relay(conf) => conf.clone(),
+        };
+
+        let token_provider = TokenProvider::new(account.clone(), config_arc.clone());
+
+        let keychain_state: rustpush::keychain::KeychainClientState =
+            match plist::from_file(dir.join("keychain.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!("read keychain state: {e}"));
+                }
+            };
+
+        let cloudkit_state: rustpush::cloudkit::CloudKitState =
+            match plist::from_file(dir.join("cloudkit.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!("read cloudkit state: {e}"));
+                }
+            };
+
+        let ck_client: Arc<rustpush::cloudkit::CloudKitClient<_>> = Arc::new(
+            rustpush::cloudkit::CloudKitClient {
+                state: DebugRwLock::new(cloudkit_state),
+                anisette: anisette.clone(),
+                config: config_arc.clone(),
+                token_provider: token_provider.clone(),
+            },
+        );
+
+        let kc_path = dir.join("keychain.plist");
+        let keychain = rustpush::keychain::KeychainClient {
+            anisette: anisette.clone(),
+            token_provider: token_provider.clone(),
+            state: DebugRwLock::new(keychain_state),
+            config: config_arc.clone(),
+            update_state: Box::new(move |update| {
+                if let Err(e) = plist::to_file_xml(&kc_path, update) {
+                    log::warn!(
+                        "setup_keychain_clique_with_bottle: failed to write keychain.plist: {e}"
+                    );
+                }
+            }),
+            container: Mutex::new(None),
+            security_container: Mutex::new(None),
+            client: ck_client.clone(),
+        };
+
+        // Idempotent: if already in the clique, nothing to do.
+        if keychain.is_in_clique().await {
+            return Ok(());
+        }
+
+        // Use the user-selected bottle directly to join the clique.
+        keychain
+            .join_clique_from_escrow(
+                selected_bottle,
+                escrow_passcode.as_bytes(),
+                device_password.as_bytes(),
+            )
+            .await
+            .map_err(|e| format!("join clique from escrow: {e:?}"))?;
+
+        Ok(())
+    }
+
+    async fn get_viable_escrow_bottles(
+        &self,
+    ) -> crate::protocol::BottlesLookup {
+        let dir = std::path::PathBuf::from(&self.state_path);
+
+        // If the in-memory session isn't populated yet, reconstruct it
+        // from gsa.plist first.
+        if self.account.lock().unwrap().is_none()
+            && self.reconstruct_account(true).await.is_err()
+        {
+            return crate::protocol::BottlesLookup::Unavailable(
+                "get_viable_escrow_bottles: failed to reconstruct account".to_string(),
+            );
+        }
+
+        let account = self.account.lock().unwrap().clone();
+        let anisette = self.anisette.lock().unwrap().clone();
+        let config = self.config.lock().unwrap().clone();
+        let (account, anisette, config) = match (account, anisette, config) {
+            (Some(a), Some(an), Some(c)) => (a, an, c),
+            _ => {
+                return crate::protocol::BottlesLookup::Unavailable(
+                    "get_viable_escrow_bottles: missing account, anisette, or config"
+                        .to_string(),
+                );
+            }
+        };
+
+        let config_arc: Arc<dyn OSConfig> = match &config {
+            api::JoinedOSConfig::MacOS(conf) => conf.clone(),
+            api::JoinedOSConfig::Relay(conf) => conf.clone(),
+        };
+
+        let token_provider = TokenProvider::new(account.clone(), config_arc.clone());
+
+        let keychain_state: rustpush::keychain::KeychainClientState =
+            match plist::from_file(dir.join("keychain.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::protocol::BottlesLookup::Unavailable(format!(
+                        "get_viable_escrow_bottles: failed to load keychain.plist: {e}",
+                    ));
+                }
+            };
+
+        let cloudkit_state: rustpush::cloudkit::CloudKitState =
+            match plist::from_file(dir.join("cloudkit.plist")) {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::protocol::BottlesLookup::Unavailable(format!(
+                        "get_viable_escrow_bottles: failed to load cloudkit.plist: {e}",
+                    ));
+                }
+            };
+
+        let ck_client: Arc<rustpush::cloudkit::CloudKitClient<_>> = Arc::new(
+            rustpush::cloudkit::CloudKitClient {
+                state: DebugRwLock::new(cloudkit_state),
+                anisette: anisette.clone(),
+                config: config_arc.clone(),
+                token_provider: token_provider.clone(),
+            },
+        );
+
+        let keychain = rustpush::keychain::KeychainClient {
+            anisette: anisette.clone(),
+            token_provider: token_provider.clone(),
+            state: DebugRwLock::new(keychain_state),
+            config: config_arc.clone(),
+            update_state: Box::new(|_| {}),
+            container: Mutex::new(None),
+            security_container: Mutex::new(None),
+            client: ck_client.clone(),
+        };
+
+        // Fetch viable escrow bottles.
+        let bottles: Vec<(crate::api::EscrowData, rustpush::keychain::EscrowMetadata)> =
+            match keychain.get_viable_bottles().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return crate::protocol::BottlesLookup::Unavailable(format!(
+                        "get_viable_escrow_bottles: get_viable_bottles failed: {e:?}",
+                    ));
+                }
+            };
+
+        if bottles.is_empty() {
+            return crate::protocol::BottlesLookup::NoBottles;
+        }
+
+        // Build one user-facing description per bottle (inline logic
+        // mirroring `describe_escrow_metadata_for_user` in the UI module
+        // — kept here to avoid a circular dependency from protocol → ui).
+        let described: Vec<(crate::api::EscrowData, String)> = bottles
+            .into_iter()
+            .map(|(data, meta)| {
+                let desc = describe_bottle(&meta);
+                (data, desc)
+            })
+            .collect();
+
+        crate::protocol::BottlesLookup::Bottles(described)
+    }
+}
+
+/// Format an `EscrowMetadata` into a user-facing display string.
+/// Mirrors the logic in `ui::describe_escrow_metadata_for_user`.
+fn describe_bottle(meta: &rustpush::keychain::EscrowMetadata) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let dict = meta.client_metadata.as_dictionary();
+    let device_name = dict
+        .and_then(|d| d.get("device_name"))
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string());
+    let device_model = dict
+        .and_then(|d| d.get("device_model"))
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string());
+
+    match (&device_name, &device_model) {
+        (Some(name), Some(model)) => {
+            parts.push(name.clone());
+            parts.push(model.clone());
+        }
+        (Some(name), None) => parts.push(name.clone()),
+        (None, Some(model)) => parts.push(model.clone()),
+        (None, None) => parts.push(meta.serial.clone()),
+    }
+
+    parts.push(meta.timestamp.clone());
+
+    let numeric_len = dict
+        .and_then(|d| d.get("SecureBackupUsesNumericPassphrase"))
+        .and_then(|v| v.as_boolean())
+        .filter(|&b| b)
+        .and_then(|_| dict.and_then(|d| d.get("SecureBackupNumericPassphraseLength")))
+        .and_then(|v| v.as_signed_integer());
+    let is_complex = dict
+        .and_then(|d| d.get("SecureBackupUsesComplexPassphrase"))
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+
+    if let Some(len) = numeric_len {
+        parts.push(format!("{len}-digit numeric passcode"));
+    } else if is_complex {
+        parts.push("complex passphrase".to_string());
+    } else {
+        parts.push("passcode".to_string());
+    }
+
+    parts.join(" — ")
 }
 
 /// Run an iCloud sync, optionally setting up the iCloud Keychain clique
@@ -1534,7 +1861,41 @@ pub async fn run_clique_setup_then_sync(
     // If a password was provided, set up the iCloud Keychain clique first.
     // On error, return the error immediately without attempting the sync.
     if let Some(p) = password {
-        backend.setup_keychain_clique(&p).await?;
+        // Backward-compat bridge: callers that only supply one password
+        // use it for both the escrow passcode and the new device password.
+        backend.setup_keychain_clique(&p, &p).await?;
+    }
+
+    // Run the missed-messages sync and wrap the result in Ok.
+    Ok(backend.sync_missed_messages(store, cutoff_ms, force).await)
+}
+
+/// Like [`run_clique_setup_then_sync`] but accepts two distinct setup secrets:
+/// the old trusted-device passcode used to recover an existing escrow bottle,
+/// and the new local device password used to create this device's bottle.
+///
+/// The behavior mirrors the single-password version:
+/// - If **both** secrets are `Some(...)`, call `setup_keychain_clique(old, new)`
+///   first. If that fails, return the error without attempting the sync.
+/// - If **either** secret is `None`, skip the setup and proceed directly to
+///   the sync.
+/// - Then call `sync_missed_messages(store, cutoff_ms, force)` and return its
+///   result wrapped in `Ok(...)`.
+///
+/// This is the entry point the UI should call instead of the single-password
+/// function once it can collect both inputs from the user.
+#[allow(dead_code)]
+pub async fn run_clique_setup_then_sync_with_secrets(
+    backend: &dyn Backend,
+    store: &crate::store::Store,
+    cutoff_ms: i64,
+    force: bool,
+    escrow_passcode: Option<String>,
+    device_password: Option<String>,
+) -> std::result::Result<crate::sync::SyncResult, String> {
+    // Both secrets must be present to attempt setup.
+    if let (Some(old), Some(new)) = (&escrow_passcode, &device_password) {
+        backend.setup_keychain_clique(old, new).await?;
     }
 
     // Run the missed-messages sync and wrap the result in Ok.
@@ -1550,16 +1911,20 @@ pub async fn run_clique_setup_then_sync(
 ///    iCloud Keychain clique is set up.
 /// 2. Based on the action:
 ///    - `SyncNow` → proceeds directly to the sync (no password needed).
-///    - `PromptForPassword` → calls `password_prompt` to obtain a
-///      password. If the user submits a password, proceeds with the
-///      sync (after joining the clique via the orchestrator). If the
-///      user cancels, returns `Ok(SyncResult::default())` to indicate
-///      "no sync was attempted".
+///    - `PromptForPassword` → calls `password_prompt` to obtain the
+///      two setup secrets: the old trusted-device passcode (to recover
+///      the existing escrow bottle) and the new local device password
+///      (to protect this device's new bottle). If the user submits
+///      both, proceeds with the sync via
+///      [`run_clique_setup_then_sync_with_secrets`]. If the user
+///      cancels, returns `Ok(SyncResult::default())` to indicate "no
+///      sync was attempted".
 ///    - `Abort(reason)` → returns `Err(reason)`.
 ///
 /// `password_prompt` is a closure (or function pointer) that the UI
 /// layer provides to show the password dialog and wait for the user's
-/// response. It returns `Some(password)` on submit, `None` on cancel.
+/// response. It returns `Some((escrow_passcode, device_password))` on
+/// submit, `None` on cancel.
 ///
 /// The closure is run via `tokio::task::spawn_blocking` so it can
 /// safely block the calling thread (it blocks on the GTK main thread
@@ -1575,14 +1940,14 @@ pub async fn orchestrate_sync_now_flow<F>(
     password_prompt: F,
 ) -> std::result::Result<crate::sync::SyncResult, String>
 where
-    F: FnOnce() -> Option<String> + Send + 'static,
+    F: FnOnce() -> Option<(String, String)> + Send + 'static,
 {
     let action = crate::protocol::decide_clique_setup_action(backend).await;
-    let password = match action {
-        CliqueSetupAction::SyncNow => None,
+    let (old_passcode, new_password) = match action {
+        CliqueSetupAction::SyncNow => (None, None),
         CliqueSetupAction::PromptForPassword => {
             match tokio::task::spawn_blocking(password_prompt).await {
-                Ok(Some(p)) => Some(p),
+                Ok(Some((old, new))) => (Some(old), Some(new)),
                 Ok(None) => return Ok(crate::sync::SyncResult::default()),
                 Err(join_err) => {
                     return Err(format!("password prompt task failed: {join_err}"))
@@ -1591,7 +1956,91 @@ where
         }
         CliqueSetupAction::Abort(reason) => return Err(reason),
     };
-    run_clique_setup_then_sync(backend, store, cutoff_ms, force, password).await
+    run_clique_setup_then_sync_with_secrets(
+        backend,
+        store,
+        cutoff_ms,
+        force,
+        old_passcode,
+        new_password,
+    )
+    .await
+}
+
+/// The result of a bottle-selection prompt: the user's chosen escrow bottle
+/// and the two distinct setup secrets (old trusted-device passcode and new
+/// local device password).
+#[derive(Debug, Clone)]
+pub struct CliqueSetupPromptResult {
+    /// The escrow bottle the user selected from the list of viable bottles.
+    pub bottle: crate::api::EscrowData,
+    /// The passcode the user entered for the selected device (decrypts the
+    /// escrow bottle).
+    pub old_passcode: String,
+    /// The new local device password (creates this device's bottle).
+    pub new_password: String,
+}
+
+/// Like [`orchestrate_sync_now_flow`] but the password-prompt closure returns
+/// an [`CliqueSetupPromptResult`] that includes the user-selected escrow
+/// bottle together with the two setup secrets, and the orchestrator forwards
+/// the selected bottle to the backend via
+/// [`Backend::setup_keychain_clique_with_bottle`].
+///
+/// This is the entry point the UI should call once it can show a bottle
+/// selection dialog alongside the password entry fields. The old
+/// `orchestrate_sync_now_flow` (which takes a closure returning a bare
+/// `Option<(String, String)>`) is preserved for backward compatibility.
+///
+/// # Behavior
+///
+/// 1. Calls `decide_clique_setup_action(backend)` to check whether the
+///    iCloud Keychain clique is set up.
+/// 2. Based on the action:
+///    - `SyncNow` → proceeds directly to the sync (no setup needed).
+///    - `PromptForPassword` → calls `prompt` (via `spawn_blocking`) to
+///      obtain a [`CliqueSetupPromptResult`]. If the user submits (Some),
+///      calls `backend.setup_keychain_clique_with_bottle(bottle, old, new)`,
+///      then syncs. If the user cancels (None), returns the default
+///      no-op sync result.
+///    - `Abort(reason)` → returns `Err(reason)`.
+#[allow(dead_code)]
+pub async fn orchestrate_sync_now_flow_with_bottle_prompt<F>(
+    backend: &dyn Backend,
+    store: &crate::store::Store,
+    cutoff_ms: i64,
+    force: bool,
+    prompt: F,
+) -> std::result::Result<crate::sync::SyncResult, String>
+where
+    F: FnOnce() -> Option<CliqueSetupPromptResult> + Send + 'static,
+{
+    let action = crate::protocol::decide_clique_setup_action(backend).await;
+    match action {
+        CliqueSetupAction::SyncNow => {
+            // Clique already set up; just sync.
+            Ok(backend.sync_missed_messages(store, cutoff_ms, force).await)
+        }
+        CliqueSetupAction::PromptForPassword => {
+            let result = match tokio::task::spawn_blocking(prompt).await {
+                Ok(Some(r)) => r,
+                Ok(None) => return Ok(crate::sync::SyncResult::default()),
+                Err(join_err) => {
+                    return Err(format!("password prompt task failed: {join_err}"))
+                }
+            };
+            // Forward the user-selected bottle + both secrets to the backend.
+            backend
+                .setup_keychain_clique_with_bottle(
+                    &result.bottle,
+                    &result.old_passcode,
+                    &result.new_password,
+                )
+                .await?;
+            Ok(backend.sync_missed_messages(store, cutoff_ms, force).await)
+        }
+        CliqueSetupAction::Abort(reason) => Err(reason),
+    }
 }
 
 /// Spike-only: dump an inbound message's salient fields. `Message` doesn't
@@ -2030,6 +2479,70 @@ fn is_incoming_content(inst: &MessageInst, handles: &[String]) -> bool {
     matches!(inst.message, Message::Message(_)) && !is_from_me(inst, handles)
 }
 
+/// Guard for launch-time 6005 retry-now suppression.
+///
+/// Allows the first 6005 resource failure to trigger `identity.refresh_now()`
+/// immediately, then suppresses repeats within a configurable cooldown, and
+/// re-arms after the cooldown elapses or on a `Generated` (successful
+/// registration) state. Non-6005 failures are always ignored.
+///
+/// Pure — no I/O, no async, no shared state.
+#[derive(Debug)]
+pub struct Launch6005RetryGuard {
+    cooldown_secs: u64,
+    last_retry_secs: Option<u64>,
+}
+
+impl Launch6005RetryGuard {
+    pub fn new(cooldown: std::time::Duration) -> Self {
+        Self {
+            cooldown_secs: cooldown.as_secs(),
+            last_retry_secs: None,
+        }
+    }
+
+    /// Evaluate a resource state change and decide whether to trigger
+    /// `identity.refresh_now()`.
+    ///
+    /// Returns `true` when the guard allows a 6005 retry-now (the caller
+    /// should call `identity.refresh_now()`). Returns `false` to suppress
+    /// (or for non-6005 states).
+    ///
+    /// Side effect: on `Generated` the internal cooldown is reset so a
+    /// *future* 6005 can fire immediately; on an allowed 6005 the last-retry
+    /// timestamp is updated to the current `now_secs`.
+    pub fn evaluate(&mut self, state: &rustpush::ResourceState, now_secs: u64) -> bool {
+        match state {
+            rustpush::ResourceState::Generated => {
+                self.last_retry_secs = None;
+                false
+            }
+            rustpush::ResourceState::Generating | rustpush::ResourceState::Closed => {
+                false
+            }
+            rustpush::ResourceState::Failed(failure) => {
+                if !is_6005_error(&failure.error) {
+                    return false;
+                }
+                match self.last_retry_secs {
+                    None => {
+                        self.last_retry_secs = Some(now_secs);
+                        true
+                    }
+                    Some(last) => {
+                        if now_secs.saturating_sub(last) >= self.cooldown_secs {
+                            self.last_retry_secs = Some(now_secs);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Walk a `PushError` chain and return `true` if any layer contains an
 /// `IDSError(6005)` — Apple's "Bad authentication, re-enter device details
 /// if persistent" rejection.
@@ -2135,18 +2648,22 @@ fn build_react_message(
 /// attachment plus an optional text caption.
 ///
 /// When `text` is `Some(s)` the payload contains two parts in this order:
-/// `MessagePart::Text` (caption) then `MessagePart::Attachment`.
+/// `MessagePart::Attachment` then `MessagePart::Text` (caption).
+/// The iPhone uses the first part's wire `message-part` index as the
+/// primary render target, so the attachment must come first to be
+/// rendered inline alongside the caption (rather than being demoted to
+/// previews-only).
 /// When `text` is `None` the payload contains a single `MessagePart::Attachment`.
 fn build_attachment_message_parts(text: Option<&str>, attachment: Attachment) -> MessageParts {
     match text {
         Some(s) => MessageParts(vec![
             IndexedMessagePart {
-                part: MessagePart::Text(s.to_string(), Default::default()),
+                part: MessagePart::Attachment(attachment),
                 idx: None,
                 ext: None,
             },
             IndexedMessagePart {
-                part: MessagePart::Attachment(attachment),
+                part: MessagePart::Text(s.to_string(), Default::default()),
                 idx: None,
                 ext: None,
             },
@@ -2458,10 +2975,17 @@ mod tests {
     /// Pin: the pure helper that builds the wire-level `MessageParts` for
     /// `send_attachment`:
     ///
-    /// * **with `text = Some(...)`**: produces a two-part `MessageParts`,
-    ///   `MessagePart::Text(...)` first then `MessagePart::Attachment(...)`,
-    ///   both with `idx: None` and `ext: None`. The text content is preserved
-    ///   as-is.
+    /// * **with `text = Some(...)`**: produces a two-part `MessageParts`
+    ///   ordered **`MessagePart::Attachment(...)` first, then
+    ///   `MessagePart::Text(...)` (the caption)**, both with `idx: None` and
+    ///   `ext: None`. The text content is preserved as-is. The Attachment-
+    ///   first ordering is required so that the iPhone renders the attachment
+    ///   inline alongside the caption — in `rustpush::MessageParts::to_xml`
+    ///   the auto-increment `my_part_idx` is only bumped on
+    ///   `MessagePart::Attachment` arms, so with `[Attachment, Text]` the
+    ///   attachment claims `message-part="0"` and the text gets `"1"`; with
+    ///   `[Text, Attachment]` both share `"0"` and the iPhone demotes the
+    ///   attachment to previews-only.
     /// * **with `text = None`**: produces a single-part `MessageParts`
     ///   containing only the `MessagePart::Attachment(...)` (photo-only case —
     ///   regression guard).
@@ -2484,7 +3008,7 @@ mod tests {
             }
         }
 
-        // -- Case 1: text = Some("hello") — two parts, text first. --
+        // -- Case 1: text = Some("hello") — two parts, attachment first. --
         let attach = fixture_attachment();
         let parts = build_attachment_message_parts(Some("hello"), attach.clone());
 
@@ -2494,17 +3018,13 @@ mod tests {
             "with text: must produce exactly 2 IndexedMessagePart entries"
         );
 
-        // First entry: MessagePart::Text with the caption, idx=None, ext=None.
+        // First entry: MessagePart::Attachment with the same attachment,
+        // idx=None, ext=None.  Pin the order: attachment first, then text
+        // caption.  The iPhone uses the first part's wire `message-part`
+        // index as the primary render target, so the Attachment must come
+        // first to be rendered inline alongside the caption (rather than
+        // being demoted to previews-only).
         match &parts.0[0].part {
-            MessagePart::Text(t, _) => assert_eq!(t, "hello", "text content must be preserved"),
-            _ => panic!("parts[0] should be MessagePart::Text"),
-        }
-        assert_eq!(parts.0[0].idx, None, "parts[0].idx should be None");
-        assert!(parts.0[0].ext.is_none(), "parts[0].ext should be None");
-
-        // Second entry: MessagePart::Attachment with the same attachment,
-        // idx=None, ext=None.  Pin the order: text first, then attachment.
-        match &parts.0[1].part {
             MessagePart::Attachment(a) => {
                 assert_eq!(a.part, attach.part, "attachment.part should match");
                 assert_eq!(
@@ -2521,7 +3041,20 @@ mod tests {
                     _ => panic!("expected a_type to be Inline in both places"),
                 }
             }
-            _ => panic!("parts[1] should be MessagePart::Attachment"),
+            _ => panic!(
+                "parts[0] should be MessagePart::Attachment (first part must be the \
+                 attachment so the iPhone renders it inline with the caption); got a \
+                 non-Attachment variant"
+            ),
+        }
+        assert_eq!(parts.0[0].idx, None, "parts[0].idx should be None");
+        assert!(parts.0[0].ext.is_none(), "parts[0].ext should be None");
+
+        // Second entry: MessagePart::Text with the caption, idx=None,
+        // ext=None.  The text content is preserved as-is.
+        match &parts.0[1].part {
+            MessagePart::Text(t, _) => assert_eq!(t, "hello", "text content must be preserved"),
+            _ => panic!("parts[1] should be MessagePart::Text (the caption)"),
         }
         assert_eq!(parts.0[1].idx, None, "parts[1].idx should be None");
         assert!(parts.0[1].ext.is_none(), "parts[1].ext should be None");
@@ -3109,10 +3642,10 @@ mod tests {
     }
 
     /// Pin: `orchestrate_sync_now_flow` — when the clique is not set up and
-    /// the user submits a password via the prompt closure, the function calls
-    /// `run_clique_setup_then_sync` with the password and returns `Ok(...)`.
-    /// Uses the stub backend's no-op implementations for both clique setup
-    /// and sync, so the result is `SyncResult::default()`.
+    /// the user submits both secrets via the prompt closure, the function calls
+    /// `run_clique_setup_then_sync_with_secrets` with the two distinct secrets
+    /// and returns `Ok(...)`. Uses the stub backend's no-op implementations for
+    /// both clique setup and sync, so the result is `SyncResult::default()`.
     #[tokio::test]
     async fn orchestrate_sync_now_flow_prompt_with_password() {
         let backend = crate::protocol::stub::StubBackend::default();
@@ -3123,7 +3656,7 @@ mod tests {
             &store,
             i64::MIN,
             false,
-            || Some("test-password".to_string()),
+            || Some(("test-escrow-passcode".to_string(), "test-device-password".to_string())),
         )
         .await;
         assert!(result.is_ok());
@@ -3171,7 +3704,7 @@ mod tests {
             false,
             move || {
                 counter.fetch_add(1, Ordering::SeqCst);
-                Some("password".to_string())
+                Some(("old-passcode".to_string(), "new-password".to_string()))
             },
         )
         .await;
@@ -3204,7 +3737,7 @@ mod tests {
             false,
             move || {
                 counter.fetch_add(1, Ordering::SeqCst);
-                Some("should-not-be-called".to_string())
+                Some(("should-not-be-called".to_string(), "should-not-be-called".to_string()))
             },
         )
         .await;
@@ -3669,5 +4202,1377 @@ mod tests {
             RegistrationStatus::LoggedOut { .. } => {} // any error string is fine
             other => panic!("expected LoggedOut, got {other:?}"),
         }
+    }
+
+    /// Pin: an IDS 6005 "bad authentication" failure that arrives with a
+    /// non-None `retry_wait` must still be surfaced to the app as
+    /// `RegistrationStatus::LoggedOut` — not `TransientFailure`.
+    ///
+    /// Background: at launch, the IdentityManager's auto-rereg can fail
+    /// with `PushError::AuthInvalid(IDSError(6005))` (Apple's
+    /// "Bad authentication, re-enter device details if persistent" — the
+    /// "stale IDS cert" symptom). The ResourceManager wraps that into a
+    /// `ResourceState::Failed(ResourceFailure { retry_wait: Some(N), error })`
+    /// and the receive loop forwards it to the UI via
+    /// `registration_status_from`. The current implementation keys
+    /// purely on `retry_wait`: any `Some(_)` → `TransientFailure`. That
+    /// is wrong for auth-invalid 6005 — Apple's 6005 means the existing
+    /// credentials are no longer accepted; a passive backoff retry won't
+    /// recover, and the user must re-onboard. Surfacing 6005 as a
+    /// transient retry causes the UI to show a "retrying..." banner that
+    /// never resolves instead of the re-auth prompt the user needs to
+    /// see.
+    ///
+    /// This test pins the contract: 6005 (any wrapping form the resource
+    /// manager might produce) must map to `LoggedOut`, with the
+    /// underlying 6005 / "authentication" cause preserved in the error
+    /// string so the UI can show a useful message.
+    #[test]
+    fn registration_status_maps_6005_retry_failure_to_logged_out() {
+        // The exact input the IdentityManager's resource state
+        // observer can produce at launch: a ResourceFailure carrying
+        // an AuthInvalid(6005) inner error, with the resource manager
+        // suggesting a 300s backoff retry. The pre-fix implementation
+        // keys on `retry_wait` alone and maps this to
+        // `TransientFailure { retry_in_s: 300, ... }`, which is the
+        // bug: the UI then loops a transient retry banner forever
+        // instead of prompting the user to re-auth.
+        let failure = rustpush::ResourceFailure {
+            retry_wait: Some(300),
+            error: Arc::new(rustpush::PushError::AuthInvalid(IDSError(6005))),
+        };
+        let state = rustpush::ResourceState::Failed(failure);
+
+        let status = super::registration_status_from(&state);
+
+        // PRIMARY assertion: must be LoggedOut (re-auth), NOT
+        // TransientFailure. The pre-fix code returns the latter.
+        match &status {
+            RegistrationStatus::LoggedOut { error } => {
+                // The error string must still surface the underlying
+                // 6005 / bad-authentication cause so the UI can
+                // render a useful message ("re-enter your Apple ID
+                // password", etc.) rather than a generic
+                // "logged out" string. The Display impl of
+                // `PushError::AuthInvalid(IDSError(6005))` includes
+                // both "6005" and "authentication" (the latter
+                // because IDSError's Display for 6005 is "Bad
+                // authentication, try again and re-enter device
+                // details if persistent. (6005)" and the
+                // thiserror wrapper prepends "Bad auth cert "). We
+                // accept either — both prove the 6005 cause is
+                // preserved.
+                assert!(
+                    error.contains("6005") || error.contains("authentication"),
+                    "LoggedOut error string should mention the underlying \
+                     6005 / bad-authentication cause, got: {error:?}"
+                );
+            }
+            RegistrationStatus::TransientFailure { retry_in_s, error } => {
+                panic!(
+                    "6005 AuthInvalid with retry_wait:Some(300) must map to \
+                     LoggedOut (re-auth required), NOT TransientFailure \
+                     (silent retry loop). The UI is currently showing a \
+                     transient retry banner for a permanent auth failure. \
+                     retry_in_s={retry_in_s} error={error:?}"
+                );
+            }
+            other => panic!(
+                "expected LoggedOut for IDS 6005 AuthInvalid, got {other:?}"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// iCloud Keychain clique setup routing
+// ---------------------------------------------------------------------------
+
+/// Route to use when setting up the iCloud Keychain clique.
+///
+/// - [`CliqueSetupRoute::JoinFromEscrow`]: at least one viable escrow bottle
+///   was found — join the existing clique via escrow recovery (voucher-based).
+/// - [`CliqueSetupRoute::Establish`]: no viable bottles — establish a brand-new
+///   clique (the first-time setup path).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CliqueSetupRoute {
+    /// Join via escrow recovery using the first viable bottle.
+    JoinFromEscrow {
+        /// Index into the viable-bottles list for the bottle to use.
+        bottle_index: usize,
+    },
+    /// Establish a brand-new clique (first-time setup).
+    Establish,
+}
+
+/// Select the clique setup route based on available viable escrow bottles.
+///
+/// Returns [`CliqueSetupRoute::JoinFromEscrow`] with `bottle_index: 0` when
+/// the list is non-empty. Returns [`CliqueSetupRoute::Establish`] when
+/// the list is empty (no previous clique to join).
+pub(crate) fn select_clique_setup_route(
+    bottles: &[(crate::api::EscrowData, rustpush::keychain::EscrowMetadata)],
+    selected_index: usize,
+) -> CliqueSetupRoute {
+    if bottles.is_empty() {
+        CliqueSetupRoute::Establish
+    } else {
+        let bottle_index = selected_index.min(bottles.len().saturating_sub(1));
+        CliqueSetupRoute::JoinFromEscrow { bottle_index }
+    }
+}
+
+#[cfg(test)]
+mod clique_setup_route_tests {
+    //! Pin: manual iCloud Keychain setup must prefer joining an existing
+    //! iCloud Keychain clique from escrow when viable bottles are available,
+    //! rather than attempting to establish a new clique. If no viable escrow
+    //! bottles are available, the existing first-time setup/establish
+    //! behavior remains allowed.
+    //!
+    //! The current `RustpushBackend::setup_keychain_clique` unconditionally
+    //! creates a new identity and calls `KeychainClient::join_clique(.., None, ..)`,
+    //! which triggers Cuttlefish `establish` — overwriting any existing
+    //! clique membership the account already has on another device.
+    //!
+    //! The fix routes through a `select_clique_setup_route` helper that
+    //! inspects the list of viable escrow bottles returned by
+    //! `KeychainClient::get_viable_bottles()` and picks:
+    //!   * `JoinFromEscrow` when at least one viable bottle is available
+    //!     (the account already belongs to a clique on another device —
+    //!     recover that peer and join via voucher), or
+    //!   * `Establish` when no viable bottles are available (first-time
+    //!     setup on a brand-new account / device).
+    //!
+    //! The two tests below exercise both branches. They will fail to compile
+    //! until the `select_clique_setup_route` function and `CliqueSetupRoute`
+    //! type are introduced in `rustpush_backend.rs` — acceptable red per
+    //! the unit's spec (the seam is the deliverable, not a fake stub).
+    use rustpush::keychain::EscrowMetadata;
+
+    /// Build a sample `(EscrowData, EscrowMetadata)` pair for testing.
+    /// The contents are irrelevant — the route-selection helper only
+    /// inspects the list *length* (viable vs not viable), not the bottle
+    /// contents, so a default-constructed `EscrowData` and a minimally-
+    /// populated `EscrowMetadata` are sufficient.
+    fn sample_bottle() -> (crate::api::EscrowData, EscrowMetadata) {
+        (
+            crate::api::EscrowData::default(),
+            EscrowMetadata {
+                serial: "ABC123".into(),
+                build: "23A".into(),
+                passcode_generation: 0,
+                timestamp: "2026-01-01".into(),
+                bottle_id: "bottle-1".into(),
+                client_metadata: plist::Value::Dictionary(plist::Dictionary::new()),
+                escrowed_spki: plist::Data::new(Vec::new()),
+                multiple_icsc: false,
+            },
+        )
+    }
+
+    /// Pin: when at least one viable escrow bottle is available, the
+    /// route must be `JoinFromEscrow` (not `Establish`). This is the core
+    /// behavior change — existing peers in the iCloud Keychain clique
+    /// should be joined via escrow, not replaced by a brand-new clique
+    /// (which would orphan the other devices in the existing clique).
+    #[test]
+    fn clique_setup_route_prefers_escrow_when_bottles_available() {
+        let bottles = vec![sample_bottle()];
+        let route = super::select_clique_setup_route(&bottles, 0);
+        assert!(
+            matches!(route, super::CliqueSetupRoute::JoinFromEscrow { .. }),
+            "expected JoinFromEscrow when viable bottles are available, got {route:?}"
+        );
+    }
+
+    /// Pin: when no viable escrow bottles are available, the route must
+    /// be `Establish` — the existing first-time setup behavior. This
+    /// preserves the "new device, no existing clique" path so the
+    /// first-ever setup on an account without prior escrow records
+    /// still works.
+    #[test]
+    fn clique_setup_route_establishes_when_no_bottles() {
+        let bottles: Vec<(crate::api::EscrowData, EscrowMetadata)> = Vec::new();
+        let route = super::select_clique_setup_route(&bottles, 0);
+        assert!(
+            matches!(route, super::CliqueSetupRoute::Establish),
+            "expected Establish when no viable bottles are available, got {route:?}"
+        );
+    }
+
+    /// Pin: `select_clique_setup_route` must take an explicit
+    /// user-selected bottle index as a second argument and preserve it
+    /// in the returned route. When the caller passes `2` and there are
+    /// 3 viable bottles, the function must NOT silently coerce the
+    /// index to 0 — it must surface `JoinFromEscrow { bottle_index: 2 }`
+    /// so the downstream code can recover and join the user-chosen
+    /// peer's bottle.
+    ///
+    /// This is the regression pin: the pre-fix code unconditionally
+    /// returned `JoinFromEscrow { bottle_index: 0 }` for any non-empty
+    /// input, which silently picked whichever bottle happened to be
+    /// first in the viable list — potentially a stale or wrong device —
+    /// and ignored the user's choice from the bottle-selection dialog.
+    #[test]
+    fn clique_setup_route_preserves_user_selected_bottle_index() {
+        let bottles = vec![sample_bottle(), sample_bottle(), sample_bottle()];
+
+        // The function must take a second argument (the user-selected
+        // index) and return a route that preserves it. Pre-fix code:
+        // single-arg, always returns index 0. This call therefore fails
+        // to compile under the pre-fix signature, which is the
+        // expected red per the unit's spec — the seam (a second
+        // `selected_index: usize` argument) is the deliverable.
+        let route = super::select_clique_setup_route(&bottles, 2);
+
+        match route {
+            super::CliqueSetupRoute::JoinFromEscrow { bottle_index } => {
+                assert_eq!(
+                    bottle_index, 2,
+                    "user-selected bottle index must be preserved in the route; \
+                     got {bottle_index}, expected 2. A single-arg function that \
+                     silently picks index 0 is the exact bug this test pins."
+                );
+            }
+            other => panic!(
+                "expected JoinFromEscrow {{ bottle_index: 2 }}, got {other:?} — \
+                 the route must surface the user-selected bottle, not fall back \
+                 to a default."
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod clique_setup_secrets_tests {
+    //! Pin: manual iCloud Keychain setup must distinguish the old trusted
+    //! device passcode used to recover an existing escrow bottle from the
+    //! new local device password used to create this device's bottle. A
+    //! single iCloud-account-password `&str` must not be the only setup
+    //! input for the escrow route.
+    //!
+    //! The vendored `join_clique_from_escrow(bottle, password, device_password)`
+    //! takes two DISTINCT byte slices: the first decrypts the escrow bottle
+    //! being recovered; the second becomes this device's password for the
+    //! new bottle it will produce. The current `Backend::setup_keychain_clique`
+    //! trait method is `(password: &str)`, and `RustpushBackend::setup_keychain_clique`
+    //! forwards the same string for both arguments:
+    //!
+    //!     join_clique_from_escrow(bottle, password.as_bytes(), password.as_bytes())
+    //!
+    //! This test will fail to compile until the orchestrator exposes a new
+    //! entry point that carries both secrets through, and the
+    //! `Backend::setup_keychain_clique` trait method is widened to take two
+    //! distinct arguments. The compile failure is the acceptable red per
+    //! the unit's spec (the seam — a value type / entry point for two
+    //! distinct clique-setup secrets — is the deliverable, not a fake stub).
+    //!
+    //! Test isolation: each `#[tokio::test]` builds its own recording fake
+    //! backend and its own tempdir-backed store; no shared state, no env vars.
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// Recording fake backend. `setup_keychain_clique` captures the two
+    /// distinct secrets it was called with; every other trait method is a
+    /// no-op that returns the default for its return type. The 2-argument
+    /// `setup_keychain_clique` signature is the seam under test: it pins
+    /// that the trait method must accept the old escrow passcode and the
+    /// new local device password as separate arguments, not collapse them
+    /// into one.
+    struct RecordingCliqueBackend {
+        recorded: Mutex<Option<(String, String)>>,
+    }
+
+    impl RecordingCliqueBackend {
+        fn new() -> Self {
+            Self {
+                recorded: Mutex::new(None),
+            }
+        }
+        fn recorded(&self) -> Option<(String, String)> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::protocol::Backend for RecordingCliqueBackend {
+        // The seam: 2-arg `setup_keychain_clique` — escrow_passcode and
+        // device_password are forwarded as separate strings, not collapsed
+        // into a single shared password.
+        async fn setup_keychain_clique(
+            &self,
+            escrow_passcode: &str,
+            device_password: &str,
+        ) -> Result<(), String> {
+            *self.recorded.lock().unwrap() = Some((
+                escrow_passcode.to_string(),
+                device_password.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn is_keychain_clique_set_up(&self) -> bool {
+            false
+        }
+
+        // --- No-op impls for the rest of the `Backend` trait. ---
+        // The trait has no default methods, so the fake must provide every
+        // one to satisfy `&dyn Backend`. The orchestrator under test only
+        // calls `setup_keychain_clique` and `sync_missed_messages`; the rest
+        // exist solely to make this a valid `Backend` impl.
+
+        async fn config_from_relay(
+            &self,
+            _code: String,
+            _host: String,
+            _token: Option<String>,
+        ) -> Result<crate::protocol::Config> {
+            Ok(crate::protocol::Config::new(()))
+        }
+
+        async fn config_from_validation_data(
+            &self,
+            _data: Vec<u8>,
+            _extra: crate::protocol::HwExtra,
+        ) -> Result<crate::protocol::Config> {
+            Ok(crate::protocol::Config::new(()))
+        }
+
+        async fn config_from_encoded(
+            &self,
+            _encoded: Vec<u8>,
+        ) -> Result<crate::protocol::Config> {
+            Ok(crate::protocol::Config::new(()))
+        }
+
+        async fn device_info(
+            &self,
+            _config: &crate::protocol::Config,
+        ) -> Result<crate::protocol::DeviceInfo> {
+            Ok(crate::protocol::DeviceInfo::default())
+        }
+
+        fn new_identity(&self) -> Result<crate::protocol::Identity> {
+            Ok(crate::protocol::Identity::new(()))
+        }
+
+        async fn setup_push(
+            &self,
+            _config: &crate::protocol::Config,
+            _identity: &crate::protocol::Identity,
+        ) -> Result<crate::protocol::Connection> {
+            Ok(crate::protocol::Connection::new(()))
+        }
+
+        async fn make_anisette(
+            &self,
+            _config: &crate::protocol::Config,
+            _conn: &crate::protocol::Connection,
+        ) -> Result<crate::protocol::Anisette> {
+            Ok(crate::protocol::Anisette::new(()))
+        }
+
+        async fn try_auth(
+            &self,
+            _config: &crate::protocol::Config,
+            _conn: &crate::protocol::Connection,
+            _anisette: &crate::protocol::Anisette,
+            _creds: Option<(String, String)>,
+        ) -> Result<(crate::protocol::Account, crate::protocol::LoginState)> {
+            Ok((
+                crate::protocol::Account::new(()),
+                crate::protocol::LoginState::default(),
+            ))
+        }
+
+        async fn try_icloud_login(
+            &self,
+            _config: &crate::protocol::Config,
+            _account: &crate::protocol::Account,
+        ) -> Result<Option<crate::protocol::IdsUser>> {
+            Ok(Some(crate::protocol::IdsUser::new(())))
+        }
+
+        async fn send_2fa_to_devices(
+            &self,
+            _account: &crate::protocol::Account,
+            _conn: &crate::protocol::Connection,
+        ) -> Result<(crate::protocol::CircleSession, crate::protocol::LoginState)> {
+            Ok((
+                crate::protocol::CircleSession::new(()),
+                crate::protocol::LoginState::default(),
+            ))
+        }
+
+        async fn verify_2fa(
+            &self,
+            _session: &crate::protocol::CircleSession,
+            _anisette: &crate::protocol::Anisette,
+            _config: &crate::protocol::Config,
+            _account: &crate::protocol::Account,
+            _code: String,
+        ) -> Result<(crate::protocol::LoginState, Option<crate::protocol::IdsUser>)> {
+            Ok((crate::protocol::LoginState::default(), None))
+        }
+
+        async fn send_2fa_sms(
+            &self,
+            _account: &crate::protocol::Account,
+        ) -> Result<crate::protocol::LoginState> {
+            Ok(crate::protocol::LoginState::default())
+        }
+
+        async fn verify_2fa_sms(
+            &self,
+            _account: &crate::protocol::Account,
+            _anisette: &crate::protocol::Anisette,
+            _config: &crate::protocol::Config,
+            _body: &crate::protocol::VerifyBody,
+            _code: String,
+        ) -> Result<(crate::protocol::LoginState, Option<crate::protocol::IdsUser>)> {
+            Ok((crate::protocol::LoginState::default(), None))
+        }
+
+        async fn register_ids(
+            &self,
+            _config: &crate::protocol::Config,
+            _conn: &crate::protocol::Connection,
+            _identity: &crate::protocol::Identity,
+            _users: Vec<crate::protocol::IdsUser>,
+        ) -> Result<crate::protocol::RegisterOutcome> {
+            Ok(crate::protocol::RegisterOutcome::Registered(Vec::new()))
+        }
+
+        async fn make_imclient(
+            &self,
+            _conn: &crate::protocol::Connection,
+            _identity: &crate::protocol::Identity,
+            _users: Vec<crate::protocol::IdsUser>,
+        ) -> Result<crate::protocol::ImClient> {
+            Ok(crate::protocol::ImClient::new(()))
+        }
+
+        async fn get_handles(
+            &self,
+            _client: &crate::protocol::ImClient,
+        ) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn restore_session(&self) -> Result<Option<crate::protocol::RestoredSession>> {
+            Ok(None)
+        }
+
+        fn start_receiving(
+            &self,
+            _connection: &crate::protocol::Connection,
+            _client: &crate::protocol::ImClient,
+            _handles: Vec<String>,
+            _store: crate::store::Store,
+            _notify: async_channel::Sender<crate::protocol::RecvEvent>,
+        ) -> std::sync::Arc<tokio::sync::Notify> {
+            std::sync::Arc::new(tokio::sync::Notify::new())
+        }
+
+        async fn send_text(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            text: String,
+            guid: String,
+        ) -> Result<crate::store::IncomingMessage> {
+            Ok(crate::store::IncomingMessage {
+                guid,
+                text: Some(text),
+                ..Default::default()
+            })
+        }
+
+        #[cfg(feature = "rustpush")]
+        async fn send_reaction(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _target_guid: &str,
+            _target_part: Option<u64>,
+            _target_text: &str,
+            _reaction: &rustpush::ReactMessageType,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        #[cfg(feature = "rustpush")]
+        async fn send_edit(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _target_guid: &str,
+            _edit_part: u64,
+            _new_text: String,
+            _new_guid: String,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_attachment(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _connection: &crate::protocol::Connection,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            path: String,
+            mime: String,
+            name: String,
+            text: Option<String>,
+            guid: String,
+        ) -> Result<crate::store::IncomingMessage> {
+            Ok(crate::store::IncomingMessage {
+                guid,
+                text,
+                attachments: vec![crate::store::AttachmentRecord {
+                    mime: Some(mime),
+                    name: Some(name),
+                    local_path: Some(path),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        }
+
+        fn send_receipt(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _read: bool,
+            _target_guid: String,
+        ) {
+        }
+
+        fn send_typing(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _typing: bool,
+        ) {
+        }
+
+        fn sign_out(&self) {}
+
+        #[cfg(feature = "rustpush")]
+        async fn sync_missed_messages(
+            &self,
+            _store: &crate::store::Store,
+            _cutoff_ms: i64,
+            _force: bool,
+        ) -> crate::sync::SyncResult {
+            crate::sync::SyncResult::default()
+        }
+    }
+
+    /// Pin: the new escrow-aware orchestrator entry point must forward the
+    /// old trusted device passcode and the new local device password to
+    /// `Backend::setup_keychain_clique` as two DISTINCT arguments. The
+    /// single-password `Option<String>` interface is not sufficient for the
+    /// escrow route — recovering an existing bottle and creating a new one
+    /// need separate secrets.
+    #[tokio::test]
+    async fn run_clique_setup_then_sync_with_secrets_forwards_old_and_new_separately() {
+        let backend = RecordingCliqueBackend::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+
+        // Two semantically distinct values: the old escrow passcode and the
+        // new device password. If the orchestrator collapsed them into a
+        // single argument, the test would see the same string in both
+        // recording slots.
+        let old_passcode = "OLD-ESCROW-PASSCODE-1234";
+        let new_device_password = "NEW-DEVICE-PASSWORD-5678";
+        assert_ne!(old_passcode, new_device_password);
+
+        let result = super::run_clique_setup_then_sync_with_secrets(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            Some(old_passcode.to_string()),
+            Some(new_device_password.to_string()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "orchestrator should succeed when both setup secrets are provided, \
+             got {result:?}"
+        );
+
+        let (got_old, got_new) = backend
+            .recorded()
+            .expect("setup_keychain_clique should have been called exactly once");
+
+        assert_eq!(
+            got_old, old_passcode,
+            "first argument to setup_keychain_clique must be the old trusted \
+             device passcode (the escrow bottle secret), not a single shared \
+             password"
+        );
+        assert_eq!(
+            got_new, new_device_password,
+            "second argument to setup_keychain_clique must be the new local \
+             device password (this device's bottle secret), distinct from the \
+             escrow passcode"
+        );
+        assert_ne!(
+            got_old, got_new,
+            "the two setup secrets must be distinct — a single password is not \
+             sufficient to both recover an existing escrow bottle and create \
+             a new local bottle"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clique_setup_bottle_prompt_tests {
+    //! Pin: the manual sync orchestrator's prompt contract must carry
+    //! the selected bottle together with the old recovery credential
+    //! and the new local device password, so the selected device can
+    //! be matched to the credential the user types. A bare
+    //! `(String, String)` tuple (the current contract) is not enough —
+    //! the orchestrator has no way to know which bottle the passcode
+    //! corresponds to.
+    //!
+    //! The fix introduces three seams:
+    //!
+    //!   1. A `CliqueSetupPromptResult` value type with three fields:
+    //!      `bottle: EscrowData`, `old_passcode: String`,
+    //!      `new_password: String`.
+    //!   2. A new orchestrator entry point
+    //!      `orchestrate_sync_now_flow_with_bottle_prompt` that takes a
+    //!      closure returning `Option<CliqueSetupPromptResult>` and
+    //!      forwards the bottle to the backend.
+    //!   3. A new `Backend::setup_keychain_clique_with_bottle` trait
+    //!      method (default impl returns an error; the production
+    //!      backend overrides it).
+    //!
+    //! The test below exercises the full path:
+    //!   1. The fake backend records the bottle identity and the two
+    //!      distinct secrets it received on
+    //!      `setup_keychain_clique_with_bottle`.
+    //!   2. The prompt closure returns
+    //!      `Some(CliqueSetupPromptResult { ... })` with a recognizable
+    //!      bottle id.
+    //!   3. The orchestrator is called with the fake backend and the
+    //!      prompt.
+    //!   4. The test asserts the recorded bottle's id matches the
+    //!      user-selected bottle, and the two secrets match what the
+    //!      closure returned.
+    //!
+    //! All state is per-test: the fake is freshly constructed, the
+    //! tempdir is per-test, and the closure captures only the
+    //! test-local values. No env vars, no shared state.
+    //!
+    //! This test fails to compile under the pre-fix code because:
+    //!   - `super::CliqueSetupPromptResult` does not exist,
+    //!   - `super::orchestrate_sync_now_flow_with_bottle_prompt` does
+    //!     not exist, and
+    //!   - the `Backend` trait has no
+    //!     `setup_keychain_clique_with_bottle` method, so the fake's
+    //!     impl block references a non-existent trait method.
+    //!
+    //! The compile error is the expected red per the unit's spec
+    //! (the seams are the deliverable, not a fake stub).
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// Recording fake backend. `setup_keychain_clique_with_bottle`
+    /// captures the bottle identity (just the `id` field, which is
+    /// what the test asserts on) and the two distinct secrets. Every
+    /// other trait method is a no-op that returns the default for
+    /// its return type, so the fake is a valid `Backend` impl.
+    struct BottlePromptRecordingBackend {
+        recorded: Mutex<Option<(String, String, String)>>,
+    }
+
+    impl BottlePromptRecordingBackend {
+        fn new() -> Self {
+            Self {
+                recorded: Mutex::new(None),
+            }
+        }
+        fn recorded(&self) -> Option<(String, String, String)> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::protocol::Backend for BottlePromptRecordingBackend {
+        // The seam: the backend must accept a user-selected bottle
+        // together with the two distinct secrets. The default impl
+        // (in the trait) returns an error; this fake overrides it to
+        // record what the orchestrator forwarded.
+        async fn setup_keychain_clique_with_bottle(
+            &self,
+            selected_bottle: &crate::api::EscrowData,
+            escrow_passcode: &str,
+            device_password: &str,
+        ) -> std::result::Result<(), String> {
+            *self.recorded.lock().unwrap() = Some((
+                selected_bottle.id.clone().unwrap_or_default(),
+                escrow_passcode.to_string(),
+                device_password.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn setup_keychain_clique(
+            &self,
+            _escrow_passcode: &str,
+            _device_password: &str,
+        ) -> std::result::Result<(), String> {
+            // Not called by the new orchestrator path; included for
+            // trait completeness so the fake is a valid `Backend`
+            // impl. The existing test for the 2-arg method (in
+            // `clique_setup_secrets_tests`) covers the call path for
+            // the legacy method.
+            Ok(())
+        }
+
+        async fn is_keychain_clique_set_up(&self) -> bool {
+            // Clique NOT set up — forces the orchestrator into the
+            // `PromptForPassword` path, which is the path the test
+            // pins. The fake's `is_keychain_clique_set_up` is
+            // per-instance (each test builds a fresh fake), so
+            // different tests can independently set the
+            // "already-set-up" flag without cross-contamination.
+            false
+        }
+
+        // --- No-op impls for the rest of the `Backend` trait. ---
+        // The trait has no default methods, so the fake must provide
+        // every one to satisfy `&dyn Backend`. The orchestrator under
+        // test only calls `is_keychain_clique_set_up`,
+        // `setup_keychain_clique_with_bottle`, and
+        // `sync_missed_messages`; the rest exist solely to make this
+        // a valid `Backend` impl.
+
+        async fn config_from_relay(
+            &self,
+            _code: String,
+            _host: String,
+            _token: Option<String>,
+        ) -> Result<crate::protocol::Config> {
+            Ok(crate::protocol::Config::new(()))
+        }
+
+        async fn config_from_validation_data(
+            &self,
+            _data: Vec<u8>,
+            _extra: crate::protocol::HwExtra,
+        ) -> Result<crate::protocol::Config> {
+            Ok(crate::protocol::Config::new(()))
+        }
+
+        async fn config_from_encoded(
+            &self,
+            _encoded: Vec<u8>,
+        ) -> Result<crate::protocol::Config> {
+            Ok(crate::protocol::Config::new(()))
+        }
+
+        async fn device_info(
+            &self,
+            _config: &crate::protocol::Config,
+        ) -> Result<crate::protocol::DeviceInfo> {
+            Ok(crate::protocol::DeviceInfo::default())
+        }
+
+        fn new_identity(&self) -> Result<crate::protocol::Identity> {
+            Ok(crate::protocol::Identity::new(()))
+        }
+
+        async fn setup_push(
+            &self,
+            _config: &crate::protocol::Config,
+            _identity: &crate::protocol::Identity,
+        ) -> Result<crate::protocol::Connection> {
+            Ok(crate::protocol::Connection::new(()))
+        }
+
+        async fn make_anisette(
+            &self,
+            _config: &crate::protocol::Config,
+            _conn: &crate::protocol::Connection,
+        ) -> Result<crate::protocol::Anisette> {
+            Ok(crate::protocol::Anisette::new(()))
+        }
+
+        async fn try_auth(
+            &self,
+            _config: &crate::protocol::Config,
+            _conn: &crate::protocol::Connection,
+            _anisette: &crate::protocol::Anisette,
+            _creds: Option<(String, String)>,
+        ) -> Result<(crate::protocol::Account, crate::protocol::LoginState)> {
+            Ok((
+                crate::protocol::Account::new(()),
+                crate::protocol::LoginState::default(),
+            ))
+        }
+
+        async fn try_icloud_login(
+            &self,
+            _config: &crate::protocol::Config,
+            _account: &crate::protocol::Account,
+        ) -> Result<Option<crate::protocol::IdsUser>> {
+            Ok(Some(crate::protocol::IdsUser::new(())))
+        }
+
+        async fn send_2fa_to_devices(
+            &self,
+            _account: &crate::protocol::Account,
+            _conn: &crate::protocol::Connection,
+        ) -> Result<(crate::protocol::CircleSession, crate::protocol::LoginState)> {
+            Ok((
+                crate::protocol::CircleSession::new(()),
+                crate::protocol::LoginState::default(),
+            ))
+        }
+
+        async fn verify_2fa(
+            &self,
+            _session: &crate::protocol::CircleSession,
+            _anisette: &crate::protocol::Anisette,
+            _config: &crate::protocol::Config,
+            _account: &crate::protocol::Account,
+            _code: String,
+        ) -> Result<(crate::protocol::LoginState, Option<crate::protocol::IdsUser>)> {
+            Ok((crate::protocol::LoginState::default(), None))
+        }
+
+        async fn send_2fa_sms(
+            &self,
+            _account: &crate::protocol::Account,
+        ) -> Result<crate::protocol::LoginState> {
+            Ok(crate::protocol::LoginState::default())
+        }
+
+        async fn verify_2fa_sms(
+            &self,
+            _account: &crate::protocol::Account,
+            _anisette: &crate::protocol::Anisette,
+            _config: &crate::protocol::Config,
+            _body: &crate::protocol::VerifyBody,
+            _code: String,
+        ) -> Result<(crate::protocol::LoginState, Option<crate::protocol::IdsUser>)> {
+            Ok((crate::protocol::LoginState::default(), None))
+        }
+
+        async fn register_ids(
+            &self,
+            _config: &crate::protocol::Config,
+            _conn: &crate::protocol::Connection,
+            _identity: &crate::protocol::Identity,
+            _users: Vec<crate::protocol::IdsUser>,
+        ) -> Result<crate::protocol::RegisterOutcome> {
+            Ok(crate::protocol::RegisterOutcome::Registered(Vec::new()))
+        }
+
+        async fn make_imclient(
+            &self,
+            _conn: &crate::protocol::Connection,
+            _identity: &crate::protocol::Identity,
+            _users: Vec<crate::protocol::IdsUser>,
+        ) -> Result<crate::protocol::ImClient> {
+            Ok(crate::protocol::ImClient::new(()))
+        }
+
+        async fn get_handles(
+            &self,
+            _client: &crate::protocol::ImClient,
+        ) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn restore_session(&self) -> Result<Option<crate::protocol::RestoredSession>> {
+            Ok(None)
+        }
+
+        fn start_receiving(
+            &self,
+            _connection: &crate::protocol::Connection,
+            _client: &crate::protocol::ImClient,
+            _handles: Vec<String>,
+            _store: crate::store::Store,
+            _notify: async_channel::Sender<crate::protocol::RecvEvent>,
+        ) -> std::sync::Arc<tokio::sync::Notify> {
+            std::sync::Arc::new(tokio::sync::Notify::new())
+        }
+
+        async fn send_text(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            text: String,
+            guid: String,
+        ) -> Result<crate::store::IncomingMessage> {
+            Ok(crate::store::IncomingMessage {
+                guid,
+                text: Some(text),
+                ..Default::default()
+            })
+        }
+
+        #[cfg(feature = "rustpush")]
+        async fn send_reaction(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _target_guid: &str,
+            _target_part: Option<u64>,
+            _target_text: &str,
+            _reaction: &rustpush::ReactMessageType,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        #[cfg(feature = "rustpush")]
+        async fn send_edit(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _target_guid: &str,
+            _edit_part: u64,
+            _new_text: String,
+            _new_guid: String,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_attachment(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _connection: &crate::protocol::Connection,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            path: String,
+            mime: String,
+            name: String,
+            text: Option<String>,
+            guid: String,
+        ) -> Result<crate::store::IncomingMessage> {
+            Ok(crate::store::IncomingMessage {
+                guid,
+                text,
+                attachments: vec![crate::store::AttachmentRecord {
+                    mime: Some(mime),
+                    name: Some(name),
+                    local_path: Some(path),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        }
+
+        fn send_receipt(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _read: bool,
+            _target_guid: String,
+        ) {
+        }
+
+        fn send_typing(
+            &self,
+            _client: &crate::protocol::ImClient,
+            _chat: &crate::store::ChatRef,
+            _my_handle: &str,
+            _typing: bool,
+        ) {
+        }
+
+        fn sign_out(&self) {}
+
+        async fn sync_missed_messages(
+            &self,
+            _store: &crate::store::Store,
+            _cutoff_ms: i64,
+            _force: bool,
+        ) -> crate::sync::SyncResult {
+            crate::sync::SyncResult::default()
+        }
+    }
+
+    /// Pin: the new orchestrator entry point
+    /// `orchestrate_sync_now_flow_with_bottle_prompt` must accept a
+    /// prompt closure that returns `Option<CliqueSetupPromptResult>`
+    /// (a struct carrying the user-selected bottle + the two distinct
+    /// setup secrets), and must forward the selected bottle to the
+    /// backend via `Backend::setup_keychain_clique_with_bottle` — not
+    /// silently pick a default bottle and drop the user's selection.
+    ///
+    /// Pre-fix behavior: the orchestrator took a closure returning
+    /// `Option<(String, String)>` and called the 2-arg
+    /// `setup_keychain_clique(old, new)` — the bottle was never visible
+    /// to the orchestrator and was silently picked by the backend (via
+    /// `select_clique_setup_route`, which defaulted to bottle index 0).
+    /// Post-fix behavior: the orchestrator carries the user-selected
+    /// bottle through the prompt, and the backend receives it via
+    /// `setup_keychain_clique_with_bottle`. This test pins the full
+    /// path: prompt → orchestrator → backend.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn orchestrate_sync_now_flow_with_bottle_prompt_forwards_selected_bottle_to_backend(
+    ) {
+        let backend = BottlePromptRecordingBackend::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+
+        // Construct the user-selected bottle with a recognizable id.
+        // Post-fix: the orchestrator must forward THIS bottle
+        // (id = "B-SELECTED-42") to the backend so the backend can
+        // match the credential to the right device. Pre-fix: the
+        // orchestrator had no notion of "selected bottle" — the
+        // backend would silently pick bottle index 0 and the user
+        // would get a wrong-device passcode prompt.
+        let mut selected_bottle = crate::api::EscrowData::default();
+        selected_bottle.id = Some("B-SELECTED-42".to_string());
+
+        let old_passcode = "OLD-ESCROW-PASSCODE-1234";
+        let new_password = "NEW-DEVICE-PASSWORD-5678";
+        assert_ne!(
+            old_passcode, new_password,
+            "test setup: the two secrets must be distinct so the backend \
+             receives them as separate arguments, not collapsed into one"
+        );
+
+        // The new orchestrator + the new prompt result type. Both
+        // seams are required for this test to compile. Pre-fix code
+        // has neither, so the test fails to compile — the expected
+        // red per the unit's spec.
+        let bottle_for_closure = selected_bottle.clone();
+        let result = super::orchestrate_sync_now_flow_with_bottle_prompt(
+            &backend,
+            &store,
+            i64::MIN,
+            false,
+            move || {
+                Some(super::CliqueSetupPromptResult {
+                    bottle: bottle_for_closure,
+                    old_passcode: old_passcode.to_string(),
+                    new_password: new_password.to_string(),
+                })
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "orchestrator should succeed when the prompt returns a valid \
+             CliqueSetupPromptResult, got {result:?}"
+        );
+
+        let (got_bottle_id, got_old, got_new) = backend
+            .recorded()
+            .expect("setup_keychain_clique_with_bottle should have been called exactly once");
+
+        // The user-selected bottle must reach the backend. If the
+        // orchestrator dropped the bottle (e.g. unwrapped the
+        // struct and passed only the secrets), the backend would
+        // see an empty id and the assertion would fail.
+        assert_eq!(
+            got_bottle_id, "B-SELECTED-42",
+            "the user-selected bottle must be forwarded to the backend; the \
+             orchestrator must not silently pick a default bottle (index 0) \
+             and drop the user's selection. The prompt contract must carry the \
+             bottle so the orchestrator can route the credential to the right \
+             device."
+        );
+        assert_eq!(
+            got_old, old_passcode,
+            "first secret forwarded to the backend must be the old trusted-device \
+             passcode (the escrow bottle secret)"
+        );
+        assert_eq!(
+            got_new, new_password,
+            "second secret forwarded to the backend must be the new local device \
+             password (this device's bottle secret)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod launch_6005_retry_guard_tests {
+    //! Pin: the launch-time 6005 retry-now guard for the registration
+    //! watcher. The receive loop currently pulses every resource-state change
+    //! straight to the UI; in production, the auto-rereg can fail with
+    //! `PushError::AuthInvalid(IDSError(6005))` *very* rapidly during the
+    //! initial resource warmup (the IdentityManager tries, fails, the
+    //! ResourceManager wraps it in a `ResourceState::Failed` with a short
+    //! `retry_wait`, the watcher re-fires, etc.). A naive "trigger
+    //! `identity.refresh_now()` on every 6005" would spam the rereg endpoint
+    //! a few times per second at launch and worsen the failure mode.
+    //!
+    //! The guard adds a cooldown: the first 6005 retry-now fires immediately
+    //! (so the self-heal path is not silently dropped — the typical
+    //! bug-repro is "no retry ever happens"), subsequent 6005 retry-nows
+    //! within the cooldown are suppressed, and any 6005 after the cooldown
+    //! elapses is allowed again. A successful (Generated) state resets the
+    //! guard so a *future* 6005 (e.g. after a sleep/wake cycle invalidates
+    //! the cert) is again allowed to fire immediately — without the reset,
+    //! the user would have to wait out the full cooldown after every
+    //! successful registration.
+    //!
+    //! This test pins the contract of the seam — a `Launch6005RetryGuard`
+    //! struct with a `cooldown: Duration` and an internal `last_retry:
+    //! Option<u64>` (seconds), constructed via `new(cooldown)` and queried
+    //! via `evaluate(&ResourceState, now_secs) -> bool`. The struct lives
+    //! next to `is_6005_error` in `rustpush_backend.rs` and is the unit
+    //! the resource watcher would call to decide whether to call
+    //! `identity.refresh_now()`. Pure, no I/O, no async.
+    //!
+    //! Test isolation: each test builds a fresh guard and uses synthetic
+    //! `u64` second timestamps — no shared state, no env vars, no clock.
+    //!
+    //! This test fails to compile under the pre-fix code because
+    //! `super::Launch6005RetryGuard` does not exist. The compile error is
+    //! the expected red per the unit's spec (the seam — a stateful guard
+    //! struct + a 5-pin behavior contract — is the deliverable, not a fake
+    //! stub).
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Build a `ResourceState::Failed` carrying an `AuthInvalid(6005)` error
+    /// — the exact form the IdentityManager's resource manager produces when
+    /// a launch-time rereg fails with Apple's "bad authentication" code.
+    /// `retry_wait: Some(300)` matches the `MAX_RESOURCE_WAIT` style
+    /// suggestion the resource manager typically attaches — the test does
+    /// NOT key on it; it keys on the inner error being 6005.
+    fn failed_6005() -> rustpush::ResourceState {
+        rustpush::ResourceState::Failed(rustpush::ResourceFailure {
+            retry_wait: Some(300),
+            error: Arc::new(rustpush::PushError::AuthInvalid(rustpush::IDSError(6005))),
+        })
+    }
+
+    /// Build a `ResourceState::Failed` carrying a non-6005 error (a
+    /// `BadMsg` PushError, the canonical generic-error sentinel in
+    /// `rustpush::PushError`). The guard must NOT trigger the 6005
+    /// self-heal retry-now on this — the self-heal is 6005-specific and
+    /// must not be widened to any failure.
+    fn failed_non_6005() -> rustpush::ResourceState {
+        rustpush::ResourceState::Failed(rustpush::ResourceFailure {
+            retry_wait: Some(300),
+            error: Arc::new(rustpush::PushError::BadMsg),
+        })
+    }
+
+    /// Pin 1: the **first** 6005 `Failed` state observed at launch must
+    /// return `true` from `evaluate` — the self-heal retry-now fires
+    /// immediately. This is the bug-repro pin: a guard that defaults to
+    /// "suppress all 6005s" (a tempting "safe" implementation) would
+    /// silently drop the launch-time retry and the user would never see
+    /// the self-heal fire. The pre-fix code (no guard at all) fires
+    /// repeatedly; the post-fix guard must fire exactly once on the first
+    /// observation, and no more until the cooldown elapses.
+    #[test]
+    fn first_6005_is_allowed_immediately() {
+        let mut guard = Launch6005RetryGuard::new(Duration::from_secs(60));
+        let state = failed_6005();
+        // The first 6005 — at any `now` value — must be allowed. The guard
+        // starts with no prior retry, so the cooldown is irrelevant for
+        // this call: it's the "fire immediately" baseline.
+        assert!(
+            guard.evaluate(&state, 0),
+            "first 6005 at t=0 must be allowed to fire refresh_now() \
+             immediately — a guard that suppresses the first 6005 would \
+             silently drop the launch-time self-heal and reintroduce the \
+             'no retry ever happens' bug"
+        );
+        // Sanity: also allow at a non-zero t (e.g. mid-test), as long as
+        // the guard has not yet observed a prior retry.
+        let mut guard2 = Launch6005RetryGuard::new(Duration::from_secs(60));
+        assert!(
+            guard2.evaluate(&state, 1_000_000),
+            "first 6005 at t=1_000_000 (no prior retry) must also be allowed"
+        );
+    }
+
+    /// Pin 2: a second 6005 `Failed` observed *within* the cooldown window
+    /// must be suppressed — the guard returns `false` and the watcher
+    /// must NOT call `identity.refresh_now()`. The cooldown prevents
+    /// the rereg endpoint from being spammed by the resource manager's
+    /// tight retry loop at launch.
+    #[test]
+    fn second_6005_within_cooldown_is_suppressed() {
+        let mut guard = Launch6005RetryGuard::new(Duration::from_secs(60));
+        let state = failed_6005();
+
+        // First 6005 at t=0: allowed.
+        assert!(
+            guard.evaluate(&state, 0),
+            "first 6005 must be allowed (sets the cooldown baseline)"
+        );
+        // Second 6005 at t=10 (well within the 60s cooldown): suppressed.
+        assert!(
+            !guard.evaluate(&state, 10),
+            "second 6005 at t=10 must be SUPPRESSED (cooldown=60s, only \
+             10s elapsed since the first retry) — without this, the rereg \
+             endpoint would be spammed by the resource manager's tight \
+             retry loop at launch"
+        );
+        // And at t=59 (1s before the cooldown boundary): still suppressed.
+        assert!(
+            !guard.evaluate(&state, 59),
+            "second 6005 at t=59 (last second of the cooldown) must also be \
+             suppressed"
+        );
+    }
+
+    /// Pin 3: a 6005 `Failed` observed *after* the cooldown has elapsed
+    /// must be allowed again — the guard re-arms. This is the "if the
+    /// self-heal didn't fix the cert the first time, try again later"
+    /// behavior. After this call the cooldown re-starts.
+    #[test]
+    fn next_6005_allowed_again_after_cooldown_elapses() {
+        let mut guard = Launch6005RetryGuard::new(Duration::from_secs(60));
+        let state = failed_6005();
+
+        // First 6005 at t=0: allowed.
+        assert!(guard.evaluate(&state, 0));
+        // Second 6005 at t=30: suppressed (within 60s cooldown).
+        assert!(!guard.evaluate(&state, 30));
+        // Third 6005 at t=61 (1s past the cooldown boundary): allowed.
+        assert!(
+            guard.evaluate(&state, 61),
+            "6005 at t=61 (cooldown=60s, 61s elapsed since the first retry) \
+             must be ALLOWED — after the cooldown the guard must re-arm so \
+             the self-heal gets a second chance if the first attempt did \
+             not clear Apple's auth state"
+        );
+        // And after a second allowed retry, a subsequent 6005 within the
+        // new cooldown must again be suppressed (cooldown re-starts).
+        assert!(
+            !guard.evaluate(&state, 90),
+            "6005 at t=90 (29s after the re-armed retry at t=61) must be \
+             suppressed — the cooldown restarts after every allowed retry"
+        );
+    }
+
+    /// Pin 4: a *non-6005* `Failed` state must NOT trigger the 6005
+    /// self-heal retry-now. The self-heal is keyed on the inner error
+    /// being a 6005 (`is_6005_error`); widening it to "any failure" would
+    /// fire `identity.refresh_now()` for transient network blips, server
+    /// restarts, etc. — exactly the spam the guard is supposed to prevent.
+    #[test]
+    fn non_6005_failure_does_not_trigger_retry() {
+        let mut guard = Launch6005RetryGuard::new(Duration::from_secs(60));
+        let state = failed_non_6005();
+
+        // A non-6005 failure at t=0 must be suppressed.
+        assert!(
+            !guard.evaluate(&state, 0),
+            "non-6005 failure (BadMsg) at t=0 must NOT trigger the 6005 \
+             self-heal retry-now — the self-heal is 6005-specific; a guard \
+             that widens to 'any failure' would spam identity.refresh_now() \
+             on every transient error"
+        );
+        // And at any later time: still suppressed.
+        assert!(
+            !guard.evaluate(&state, 1_000_000),
+            "non-6005 failure at t=1_000_000 must also NOT trigger the \
+             6005 self-heal retry-now"
+        );
+    }
+
+    /// Pin 5: a `ResourceState::Generated` observation resets the guard
+    /// — a *future* 6005 (e.g. after a sleep/wake cycle invalidates the
+    /// cert, the typical launch-time 6005 re-fire scenario) must be
+    /// allowed to fire `refresh_now()` immediately, *without* having to
+    /// wait out the cooldown. The cooldown is a backoff for repeated
+    /// failures; a successful registration in between means the failure
+    /// is no longer "in flight" and the next 6005 is a fresh incident.
+    ///
+    /// Sequence: first 6005 (allow) → second 6005 within cooldown
+    /// (suppress) → Generated (reset) → fresh 6005 (allow immediately).
+    #[test]
+    fn generated_state_resets_guard() {
+        let mut guard = Launch6005RetryGuard::new(Duration::from_secs(60));
+        let state_6005 = failed_6005();
+        let state_generated = rustpush::ResourceState::Generated;
+
+        // First 6005 at t=0: allowed.
+        assert!(guard.evaluate(&state_6005, 0));
+        // Second 6005 at t=10: suppressed (within cooldown).
+        assert!(
+            !guard.evaluate(&state_6005, 10),
+            "second 6005 within cooldown must be suppressed (sanity)"
+        );
+        // A Generated state arrives at t=20 — the rereg has succeeded.
+        // This must reset the guard.
+        let _ = guard.evaluate(&state_generated, 20);
+        // A *fresh* 6005 at t=21 (1s after the Generated reset): must be
+        // allowed immediately — the cooldown is no longer in effect.
+        assert!(
+            guard.evaluate(&state_6005, 21),
+            "a fresh 6005 at t=21 (1s after a Generated reset at t=20) must \
+             be allowed to fire refresh_now() immediately — without the \
+             reset, the user would have to wait out the full cooldown after \
+             every successful registration, defeating the purpose of the \
+             self-heal"
+        );
+    }
+
+    /// Pin 6 (sanity): the `Generating` and `Closed` states (the other
+    /// `ResourceState` variants) must NOT trigger the 6005 self-heal
+    /// retry-now. `Generating` means a rereg is already in flight
+    /// (calling `refresh_now()` again would race it); `Closed` means
+    /// the resource is gone (refresh would be a no-op or error). This
+    /// pins that the guard is keyed on the 6005 inner error, not on
+    /// "any non-Generated state".
+    #[test]
+    fn generating_and_closed_states_do_not_trigger_retry() {
+        let mut guard = Launch6005RetryGuard::new(Duration::from_secs(60));
+
+        // Generating: a rereg is already in flight. The self-heal must
+        // not stack another refresh_now on top.
+        assert!(
+            !guard.evaluate(&rustpush::ResourceState::Generating, 0),
+            "Generating state must NOT trigger 6005 self-heal retry-now — \
+             a rereg is already in flight and refresh_now() would race it"
+        );
+        // Closed: the resource is gone. refresh_now() is a no-op at
+        // best, an error at worst.
+        assert!(
+            !guard.evaluate(&rustpush::ResourceState::Closed, 0),
+            "Closed state must NOT trigger 6005 self-heal retry-now — \
+             the resource is gone and refresh_now() would be a no-op or error"
+        );
+        // Registered (Generated) on its own: must NOT trigger the 6005
+        // self-heal (it is the success state). But it should still be
+        // accepted without panicking and should reset any prior cooldown
+        // (covered by pin 5).
+        assert!(
+            !guard.evaluate(&rustpush::ResourceState::Generated, 0),
+            "Generated state must NOT by itself trigger a 6005 self-heal \
+             retry-now (it is the success state; the watcher should pass it \
+             straight to the UI as RegistrationStatus::Registered)"
+        );
     }
 }

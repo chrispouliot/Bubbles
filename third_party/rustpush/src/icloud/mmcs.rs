@@ -661,7 +661,7 @@ pub struct ChunkDesc {
 impl ChunkDesc {
     fn encrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PushError> {
         Ok(match self.key {
-            ChunkEncryption::V1(key) => encrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?,
+            ChunkEncryption::V1(key) => encrypt(Cipher::aes_128_cfb128(), &key[1..], Some(&[0u8; 16]), &data)?,
             ChunkEncryption::V2(key, _) => {
                 let hk = Hkdf::<Sha256>::new(None, &key[1..]);
                 let mut expanded_key = [0u8; 0x60];
@@ -692,7 +692,7 @@ impl ChunkDesc {
 
     fn decrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PushError> {
         Ok(match self.key {
-            ChunkEncryption::V1(key) => decrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?,
+            ChunkEncryption::V1(key) => decrypt(Cipher::aes_128_cfb128(), &key[1..], Some(&[0u8; 16]), &data)?,
             ChunkEncryption::V2(key, len) => {
                 let hk = Hkdf::<Sha256>::new(None, &key[1..]);
                 let mut expanded_key = [0u8; 0x60];

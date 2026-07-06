@@ -1588,7 +1588,7 @@ pub fn rfc6637_wrap_key<T: HasPublic>(public_key: &CompactECKey<T>, key: &[u8], 
         *i = padding_count as u8;
     }
 
-    let mut c = Crypter::new(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), Mode::Encrypt, &aes_key[..16], None)?;
+    let mut c = Crypter::new(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), Mode::Encrypt, &aes_key[..16], Some(&[0xA6u8; 8]))?;
     let mut out = vec![0u8; message.len() + 16];
 
     let mut count = c.update(&message, &mut out)?;
@@ -1618,7 +1618,7 @@ pub fn rfc6637_unwrap_key(private_key: &CompactECKey<Private>, wrapped_key: &[u8
     // RFC6637 KDF
     let hash = rfc6637_kdf(fingerprint, &secret);
 
-    let unwrapped = decrypt(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), &hash[..16], None, &unpacked.wrapped)?;
+    let unwrapped = decrypt(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), &hash[..16], Some(&[0xA6u8; 8]), &unpacked.wrapped)?;
 
     let padding_len = *unwrapped.last().unwrap() as usize;
     for i in 0..padding_len {
@@ -1835,6 +1835,46 @@ fn compact_test() -> Result<(), PushError> {
     println!("what");
     public.verify(MessageDigest::sha256(), &data, sig)?;
     
+    Ok(())
+}
+
+#[test]
+fn crypto_iv_rfc6637_wrap_unwrap_roundtrip() -> Result<(), PushError> {
+    // Regression: OpenSSL 0.10.81's `Crypter::new` panics with
+    // "an IV is required for this cipher" when the cipher has a non-zero IV
+    // length and `iv` is `None`. `rfc6637_wrap_key` / `rfc6637_unwrap_key`
+    // call into `Crypter::new` with `Nid::ID_AES128_WRAP` and `None`, which
+    // panics on that OpenSSL version. These helpers are exercised by
+    // PCS/escrow/keychain code paths, so the panic surfaces as a crash
+    // rather than a recoverable error.
+    //
+    // This test pins the behavior: a wrap/unwrap round trip must succeed
+    // without panicking. Currently the wrap call panics, so the test
+    // fails red on the current (broken) implementation.
+
+    // Deterministic 16-byte key (typical AES-128 payload size) and a
+    // 20-byte fingerprint (matches the RFC 6637 KDF expectation in
+    // rfc6637_kdf).
+    let key: [u8; 16] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+    ];
+    let fingerprint = [0xABu8; 20];
+
+    // Generate a private key and use it as both the "public" key for wrap
+    // (Private implements HasPublic) and the "private" key for unwrap.
+    let eckey = CompactECKey::<Private>::new()?;
+
+    // Wrap must not panic. If the openssl 0.10.81 panic is present,
+    // this line aborts the test process.
+    let wrapped = rfc6637_wrap_key(&eckey, &key, &fingerprint)?;
+
+    // Unwrap must not panic either.
+    let unwrapped = rfc6637_unwrap_key(&eckey, &wrapped, &fingerprint)?;
+
+    // And the round trip must recover the original key bytes.
+    assert_eq!(unwrapped, key.to_vec());
+
     Ok(())
 }
 

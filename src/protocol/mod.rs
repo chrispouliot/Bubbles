@@ -436,10 +436,14 @@ pub trait Backend: Send + Sync {
     // --- 9. keychain clique setup ---
 
     /// Join the iCloud Keychain encryption trust group ("clique") using the
-    /// user's iCloud account password as the device password. This is
-    /// required before any CloudKit-based sync (iMessage in iCloud, keychain
-    /// sync) can succeed. Idempotent: if the clique is already set up,
-    /// returns `Ok(())` without making any network calls.
+    /// old trusted-device passcode (to recover an existing escrow bottle) and
+    /// the new local device password (to create this device's bottle). Required
+    /// before any CloudKit-based sync (iMessage in iCloud, keychain sync) can
+    /// succeed. Idempotent: if the clique is already set up, returns `Ok(())`
+    /// without making any network calls.
+    ///
+    /// For first-time establish (no viable bottles) the `escrow_passcode` is
+    /// ignored and only `device_password` is used to create the new clique.
     ///
     /// Errors are surfaced as a string describing what went wrong. A more
     /// typed error can come in a follow-up; for now `Result<(), String>` is
@@ -447,7 +451,8 @@ pub trait Backend: Send + Sync {
     #[allow(dead_code)]
     async fn setup_keychain_clique(
         &self,
-        password: &str,
+        escrow_passcode: &str,
+        device_password: &str,
     ) -> std::result::Result<(), String>;
 
     /// Returns `true` if the iCloud Keychain clique is set up on this device,
@@ -460,6 +465,40 @@ pub trait Backend: Send + Sync {
     /// password (clique not set up) before triggering a CloudKit sync.
     #[allow(dead_code)]
     async fn is_keychain_clique_set_up(&self) -> bool;
+
+    /// Join the iCloud Keychain clique using a specific, user-selected escrow
+    /// bottle. This is the bottle-aware variant of [`setup_keychain_clique`]:
+    /// instead of silently picking the first viable bottle, the caller has
+    /// already shown the user a list of viable bottles and obtained a selection.
+    ///
+    /// The default implementation returns an error; production backends that
+    /// support bottle selection must override this.
+    #[allow(dead_code)]
+    async fn setup_keychain_clique_with_bottle(
+        &self,
+        _selected_bottle: &crate::api::EscrowData,
+        _escrow_passcode: &str,
+        _device_password: &str,
+    ) -> std::result::Result<(), String> {
+        Err("setup_keychain_clique_with_bottle: not implemented".to_string())
+    }
+
+    /// Returns viable escrow bottles for the user's iCloud Keychain clique.
+    /// Each tuple carries the opaque `EscrowData` (needed by
+    /// [`setup_keychain_clique_with_bottle`]) and a user-facing description
+    /// string (e.g. "Alice's iPhone — iPhone15,2 — 2026-04-01 — 6-digit
+    /// numeric passcode") so the UI can present a selection list.
+    ///
+    /// Returns a [`BottlesLookup`] that distinguishes three states: bottles
+    /// present, no bottles (first-time setup), and unavailable/error. The
+    /// pre-fix fallback-to-establish behaviour on error was the bug; the
+    /// caller should use [`decide_bottles_lookup_action`] to determine the
+    /// correct action and surface errors instead of silently treating them
+    /// as no-bottles.
+    #[allow(dead_code)]
+    async fn get_viable_escrow_bottles(&self) -> BottlesLookup {
+        BottlesLookup::NoBottles
+    }
 }
 
 /// Walk the error chain and return the [`SendErrorCategory`] that best
@@ -518,6 +557,55 @@ pub enum CliqueSetupAction {
     PromptForPassword,
     /// The backend cannot service the request.
     Abort(String),
+}
+
+/// Result of looking up viable escrow bottles from the iCloud Keychain.
+///
+/// This distinguishes three states that the pre-fix code collapsed into a
+/// single empty-Vec signal, causing bottle-lookup errors to be silently
+/// treated as "no bottles" (showing the old two-textbox first-time establish
+/// prompt instead of surfacing the error).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BottlesLookup {
+    /// Viable escrow bottles exist. The Vec is non-empty (but callers should
+    /// not rely on that invariant; an empty Vec is treated as `NoBottles` by
+    /// the decision helper).
+    Bottles(Vec<(crate::api::EscrowData, String)>),
+    /// No viable bottles exist — legitimate first-time establish situation.
+    NoBottles,
+    /// Bottle lookup failed / backend cannot service the request. Carries
+    /// a human-readable reason for logging / surfacing.
+    Unavailable(String),
+}
+
+/// What the UI should do after a bottle lookup, driven by
+/// [`decide_bottles_lookup_action`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum BottlesLookupAction {
+    /// Viable bottles exist; show a bottle-selection dialog and use the
+    /// bottle-aware orchestrator path.
+    ShowBottleSelection(Vec<(crate::api::EscrowData, String)>),
+    /// No viable bottles; use the first-time establish path (old two-textbox
+    /// prompt).
+    EstablishFirstTime,
+    /// Bottle lookup failed / backend cannot service the request. Surface
+    /// the error reason instead of showing any prompt.
+    SurfaceError(String),
+}
+
+/// Map a [`BottlesLookup`] result to the corresponding
+/// [`BottlesLookupAction`] the UI should take.
+///
+/// This is a pure function: no I/O, no async, no display dependency.
+#[allow(dead_code)]
+pub fn decide_bottles_lookup_action(lookup: BottlesLookup) -> BottlesLookupAction {
+    match lookup {
+        BottlesLookup::Bottles(bottles) => {
+            BottlesLookupAction::ShowBottleSelection(bottles)
+        }
+        BottlesLookup::NoBottles => BottlesLookupAction::EstablishFirstTime,
+        BottlesLookup::Unavailable(reason) => BottlesLookupAction::SurfaceError(reason),
+    }
 }
 
 /// Decide what the UI should do when the user requests a CloudKit sync.
@@ -608,5 +696,94 @@ mod clique_setup_action_tests {
         let backend = StubBackend::default();
         let action = decide_clique_setup_action(&backend).await;
         assert_eq!(action, CliqueSetupAction::PromptForPassword);
+    }
+}
+
+#[cfg(test)]
+mod clique_setup_bottles_lookup_tests {
+    //! Pin: the manual Sync Now flow must not silently treat a failure
+    //! to fetch viable escrow bottles as "no bottles" and show the old
+    //! two-textbox first-time setup prompt. Bottle lookup must
+    //! distinguish at least three states — bottles present, no bottles,
+    //! and unavailable/error — so errors can be surfaced/logged and
+    //! don't masquerade as first-time establish.
+    //!
+    //! The pre-fix `Backend::get_viable_escrow_bottles` returns
+    //! `Vec<(EscrowData, String)>` defaulting to empty, and the real
+    //! backend's implementation (in `rustpush_backend.rs` ≈line 1630)
+    //! has multiple silent `return Vec::new()` paths: reconstruct
+    //! failure, missing `keychain.plist`, and
+    //! `keychain.get_viable_bottles().await` error. The UI handler at
+    //! `ui/mod.rs` ≈line 2105 then branches on `bottles.is_empty()`
+    //! and shows the old establish prompt — silently treating errors
+    //! as "no bottles". This is the user-reported bug: Sync Now shows
+    //! no device dropdown, only the two text boxes, because the
+    //! backend's `Vec` return collapsed an error into the empty path.
+    //!
+    //! The fix introduces `super::BottlesLookup` (an enum with three
+    //! variants) and a `super::decide_bottles_lookup_action` helper
+    //! that maps the three states to three distinct actions. The
+    //! `Unavailable` variant carries the error reason and maps to a
+    //! non-establish action so errors are surfaced/logged and don't
+    //! masquerade as first-time establish.
+    //!
+    //! This test fails to compile under the pre-fix code because
+    //! `super::BottlesLookup` and `super::decide_bottles_lookup_action`
+    //! do not exist. The compile error is the expected red per the
+    //! unit's spec (the seams are the deliverable, not a fake stub).
+    //!
+    //! Test isolation: the test constructs `BottlesLookup` values
+    //! directly and calls a pure function; no backend, no shared
+    //! state, no env vars.
+
+    /// Pin: the bottle lookup must distinguish three states, and the
+    /// `Unavailable` state must NOT collapse to the same action as
+    /// `NoBottles`. The pre-fix bug collapsed errors into the
+    /// establish path; the new contract must keep them distinct so the
+    /// UI can surface the error instead of showing the old two-textbox
+    /// first-time setup prompt.
+    #[test]
+    fn clique_setup_bottles_lookup_unavailable_does_not_collapse_to_no_bottles() {
+        // State 1: bottles present (empty Vec here is just to construct
+        // the variant; the test only cares about variant identity).
+        let with_bottles = super::BottlesLookup::Bottles(Vec::new());
+        // State 2: legitimate first-time setup (no bottles exist).
+        let no_bottles = super::BottlesLookup::NoBottles;
+        // State 3: error / backend cannot service the request.
+        let unavailable =
+            super::BottlesLookup::Unavailable("reconstruct failed".to_string());
+
+        // Map each state to its action via the decision helper. The
+        // helper must exist with a sync signature taking a
+        // `BottlesLookup` and returning a comparable action.
+        let action_with_bottles =
+            super::decide_bottles_lookup_action(with_bottles);
+        let action_no_bottles = super::decide_bottles_lookup_action(no_bottles);
+        let action_unavailable =
+            super::decide_bottles_lookup_action(unavailable);
+
+        // CRITICAL: `Unavailable` must not map to the same action as
+        // `NoBottles`. The pre-fix bug collapsed errors into the
+        // establish path; the new contract must keep them distinct so
+        // the UI can surface the error instead of showing the old
+        // two-textbox first-time setup prompt.
+        assert_ne!(
+            action_unavailable, action_no_bottles,
+            "Unavailable must not collapse to the same action as NoBottles; \
+             the pre-fix bug silently showed the old two-textbox first-time \
+             setup prompt when bottle lookup failed. \
+             Unavailable→{action_unavailable:?}, NoBottles→{action_no_bottles:?}"
+        );
+
+        // All three states must map to distinct actions (sanity check
+        // that the lookup has three distinguishable outcomes, not two).
+        assert_ne!(
+            action_with_bottles, action_no_bottles,
+            "Bottles and NoBottles must map to distinct actions"
+        );
+        assert_ne!(
+            action_with_bottles, action_unavailable,
+            "Bottles and Unavailable must map to distinct actions"
+        );
     }
 }

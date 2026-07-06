@@ -50,7 +50,7 @@ pub fn cloud_message_to_ingest(
         {
             return Ingest::Tapback(Tapback {
                 guid: cm.guid,
-                chat: chat_ref_for(&cm.chat_id, &cm.service, chat_map),
+                chat: chat_ref_for(&cm.chat_id, &cm.service, chat_map, &cm.sender, from_me, &cm.destination_caller_id),
                 sender: Some(cm.sender),
                 is_from_me: from_me,
                 date: apple_time_to_unix_ms(cm.time),
@@ -65,7 +65,7 @@ pub fn cloud_message_to_ingest(
     if let Some(ref text) = proto.text {
         return Ingest::Message(IncomingMessage {
             guid: cm.guid,
-            chat: chat_ref_for(&cm.chat_id, &cm.service, chat_map),
+            chat: chat_ref_for(&cm.chat_id, &cm.service, chat_map, &cm.sender, from_me, &cm.destination_caller_id),
             sender: Some(cm.sender),
             is_from_me: from_me,
             text: Some(text.clone()),
@@ -94,10 +94,20 @@ fn is_from_me(flags: &MessageFlags, sender: &str, my_handles: &[String]) -> bool
 
 /// Build a [`ChatRef`] from the cloud chat map, or a minimal fallback when the
 /// chat hasn't been synced yet.
+///
+/// When cloud metadata is available, the participants and display name come
+/// from [`CloudChat`]. When metadata is absent, the raw compound `chat_id`
+/// (e.g. `iMessage;-;+12345`) must **not** be used as a participant because
+/// the UI splits participants on `;` and would produce fake labels. Instead
+/// the message `sender` handle is used as the sole participant — it is always
+/// a display-safe handle (email or phone URI).
 fn chat_ref_for(
     chat_id: &str,
     service: &str,
     chat_map: &HashMap<String, CloudChat>,
+    sender: &str,
+    from_me: bool,
+    destination_caller_id: &str,
 ) -> ChatRef {
     if let Some(cloud_chat) = chat_map.get(chat_id) {
         ChatRef {
@@ -106,8 +116,27 @@ fn chat_ref_for(
             service: Some(service.to_string()),
         }
     } else {
+        // Fallback: use the sender handle rather than the raw compound
+        // chat_id. The sender is always a display-safe handle (email, tel,
+        // etc.) — never the opaque compound chat_id.
+        //
+        // For from-me messages, also include the destination_caller_id (the
+        // other participant) so the resulting ChatRef keys like an existing
+        // local one-to-one chat and the message merges into it rather than
+        // creating a self-only chat.
+        let participants: Vec<String> = if sender.is_empty() {
+            // If sender is also empty, use a placeholder to keep the
+            // participant list non-empty. This should be extremely rare.
+            vec![format!("unknown-{}", service)]
+        } else {
+            let mut p = vec![sender.to_string()];
+            if from_me && !destination_caller_id.is_empty() {
+                p.push(destination_caller_id.to_string());
+            }
+            p
+        };
         ChatRef {
-            participants: vec![chat_id.to_string()],
+            participants,
             display_name: None,
             service: Some(service.to_string()),
         }
@@ -422,6 +451,18 @@ pub fn clear_last_sync_error(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Return a finite recent-history cutoff of approximately 48 hours before
+/// `now_ms` (unix epoch milliseconds).
+///
+/// Manual "Sync Now" should use this rather than `i64::MIN` so that Cloud
+/// Messages pagination stops once it reaches messages older than ~48 h.
+/// Saturates to `i64::MIN + 1` so the sentinel value is never returned
+/// (the caller uses `i64::MIN` as "no cutoff").
+pub fn manual_sync_cutoff_ms(now_ms: i64) -> i64 {
+    const FORTY_EIGHT_HOURS_MS: i64 = 48 * 60 * 60 * 1000;
+    now_ms.saturating_sub(FORTY_EIGHT_HOURS_MS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +473,444 @@ mod tests {
         cloudmessagesp::MessageProto,
     };
     use crate::store::{Ingest, IncomingMessage, Tapback, ChatRef, Store};
+
+    // ---------------------------------------------------------------------------
+    // cloud_sync_chat_metadata — pin: CloudKit-synced messages must not create
+    // chat participants/list labels from opaque or compound
+    // `CloudMessage.chat_id` values such as `iMessage;-;+12345`; when CloudKit
+    // chat metadata is available, `chat_ref_for` (via `cloud_message_to_ingest`)
+    // must use `CloudChat.participants` and `display_name` from the chat map
+    // so the resulting `ChatRef` lists real `tel:`/`mailto:` URIs (not the raw
+    // compound chat_id) and the UI chat list merges with live-push chat keys.
+    // When no metadata is available, the raw compound chat_id must still NOT
+    // become a participant (it gets split on `;` in the UI and produces fake
+    // labels like "imessage, -, +12345").
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn cloud_sync_chat_metadata_uses_cloud_chat_not_raw_chat_id() {
+        use rustpush::cloud_messages::CloudParticipant;
+
+        // Compound opaque chat_id like Apple uses in CloudKit CloudMessage.
+        // Real-world values look like "iMessage;-;+1234567890" — the separators
+        // would render as fake participants if the raw value were used.
+        let chat_id = "iMessage;-;+12345";
+
+        // Synthetic CloudChat with realistic participants and a group name.
+        let cloud_chat = CloudChat {
+            participants: vec![
+                CloudParticipant { uri: "tel:+12345".to_string() },
+                CloudParticipant { uri: "mailto:alice@example.com".to_string() },
+            ],
+            display_name: Some("Weekend Crew".to_string()),
+            ..Default::default()
+        };
+
+        let mut chat_map: HashMap<String, CloudChat> = HashMap::new();
+        chat_map.insert(chat_id.to_string(), cloud_chat);
+
+        // -------------------------------------------------------------------
+        // GOOD PATH: chat_map has the CloudChat for this chat_id.
+        // `chat_ref_for` must return a ChatRef built from CloudChat metadata,
+        // not from the raw compound `chat_id`.
+        // -------------------------------------------------------------------
+        let cm_good = CloudMessage {
+            utm: None,
+            r#type: 0,
+            error: 0,
+            chat_id: chat_id.to_string(),
+            sender: "alice@example.com".to_string(),
+            time: 0,
+            msg_proto_2: None,
+            destination_caller_id: String::new(),
+            msg_proto: GZipWrapper(MessageProto {
+                text: Some("hi from cloud".to_string()),
+                ..Default::default()
+            }),
+            flags: MessageFlags::IS_FINISHED,
+            guid: "ck-msg-good".to_string(),
+            msg_proto_3: None,
+            service: "iMessage".to_string(),
+            msg_proto_4: None,
+        };
+
+        let result = cloud_message_to_ingest(
+            cm_good,
+            &["me@example.com".to_string()],
+            &chat_map,
+        );
+
+        match result {
+            Ingest::Message(msg) => {
+                // Participants must come from CloudChat URIs, NOT the raw chat_id.
+                assert!(
+                    !msg.chat.participants.iter().any(|p| p == chat_id),
+                    "GOOD path: ChatRef.participants must not contain the raw \
+                     compound chat_id '{}', got: {:?}",
+                    chat_id, msg.chat.participants,
+                );
+                assert!(
+                    msg.chat.participants.iter().any(|p| p == "tel:+12345"),
+                    "GOOD path: ChatRef.participants must contain 'tel:+12345' \
+                     from CloudChat metadata, got: {:?}",
+                    msg.chat.participants,
+                );
+                assert!(
+                    msg.chat.participants.iter().any(|p| p == "mailto:alice@example.com"),
+                    "GOOD path: ChatRef.participants must contain \
+                     'mailto:alice@example.com' from CloudChat metadata, got: {:?}",
+                    msg.chat.participants,
+                );
+                // Display name is preserved from the CloudChat.
+                assert_eq!(
+                    msg.chat.display_name,
+                    Some("Weekend Crew".to_string()),
+                    "GOOD path: ChatRef.display_name must be preserved from \
+                     CloudChat metadata",
+                );
+
+                // Deduplication invariant: the resulting ChatRef's key must
+                // match a live-push ChatRef built with the same participant
+                // URIs. This pins that CloudKit-synced messages merge into
+                // the same chat row as live-push messages.
+                let live_push_chat_ref = ChatRef {
+                    participants: vec![
+                        "tel:+12345".to_string(),
+                        "mailto:alice@example.com".to_string(),
+                    ],
+                    display_name: None,
+                    service: Some("iMessage".to_string()),
+                };
+                assert_eq!(
+                    msg.chat.key(),
+                    live_push_chat_ref.key(),
+                    "GOOD path: CloudKit ChatRef.key() must equal live-push \
+                     ChatRef.key() for the same participants (dedup invariant)",
+                );
+            }
+            other => panic!("GOOD path: expected Ingest::Message, got {:?}", other),
+        }
+
+        // -------------------------------------------------------------------
+        // FALLBACK: chat_map does NOT have the CloudChat for this chat_id
+        // (this is the path currently taken by `sync_missed_messages`, which
+        // passes an empty `chat_map`). The raw compound chat_id must still
+        // NOT become a participant — it gets split on `;` in the UI and
+        // produces fake labels like "imessage, -, +12345".
+        // -------------------------------------------------------------------
+        let empty_chat_map: HashMap<String, CloudChat> = HashMap::new();
+
+        let cm_fallback = CloudMessage {
+            utm: None,
+            r#type: 0,
+            error: 0,
+            chat_id: chat_id.to_string(),
+            sender: "stranger@example.com".to_string(),
+            time: 0,
+            msg_proto_2: None,
+            destination_caller_id: String::new(),
+            msg_proto: GZipWrapper(MessageProto {
+                text: Some("hi stranger".to_string()),
+                ..Default::default()
+            }),
+            flags: MessageFlags::IS_FINISHED,
+            guid: "ck-msg-fallback".to_string(),
+            msg_proto_3: None,
+            service: "iMessage".to_string(),
+            msg_proto_4: None,
+        };
+
+        let result_fb = cloud_message_to_ingest(
+            cm_fallback,
+            &["me@example.com".to_string()],
+            &empty_chat_map,
+        );
+
+        match result_fb {
+            Ingest::Message(msg) => {
+                assert!(
+                    !msg.chat.participants.iter().any(|p| p == chat_id),
+                    "FALLBACK path: ChatRef.participants must not contain the raw \
+                     compound chat_id '{}' (it would be split on ';' and produce \
+                     fake labels in the UI), got: {:?}",
+                    chat_id, msg.chat.participants,
+                );
+                assert!(
+                    !msg.chat.participants.is_empty(),
+                    "FALLBACK path: ChatRef.participants must not be empty \
+                     (downstream code assumes a non-empty participant list)",
+                );
+            }
+            other => panic!("FALLBACK path: expected Ingest::Message, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // cloud_sync_empty_chat_map_merges_matching_existing_chat — pin: when
+    // CloudKit sync hands us a `CloudMessage` whose `chat_id` is absent from
+    // `chat_map` (so the metadata-backed path can't be used), the fallback
+    // `ChatRef` must still identify the *other* party so the message lands in
+    // the same local chat that already exists for that participant. This is
+    // especially important for from-me messages where `sender` matches one of
+    // `my_handles`: a naive fallback that uses `sender` as the sole participant
+    // would key the chat by the user's own handle, creating a self-only chat
+    // that doesn't match the existing one-to-one thread. The compound chat_id
+    // (`iMessage;-;+12345`) must never become a participant (the UI would split
+    // it on `;` and produce fake labels), but the destination must be resolved
+    // from the other CloudKit fields (e.g. `destination_caller_id`).
+    //
+    // Also pins the inverse: a CloudKit message for a *different* participant
+    // must create its own chat rather than being merged into the existing one.
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cloud_sync_empty_chat_map_merges_matching_existing_chat() {
+        let store = Store::open_in_memory().await.unwrap();
+
+        let my_handle = "mailto:me@icloud.com".to_string();
+        let other_handle = "tel:+12345".to_string();
+        let my_handles = vec![my_handle.clone()];
+
+        // --- 1. Seed an existing local one-to-one chat with the other party. ---
+        let existing_chat = ChatRef {
+            participants: vec![other_handle.clone(), my_handle.clone()],
+            display_name: None,
+            service: Some("iMessage".to_string()),
+        };
+        let seed_date_ms: i64 = 1_700_000_000_000;
+        store
+            .apply(Ingest::Message(IncomingMessage {
+                guid: "local-seed-1".to_string(),
+                chat: existing_chat.clone(),
+                sender: Some(other_handle.clone()),
+                is_from_me: false,
+                text: Some("hello from local".to_string()),
+                date: seed_date_ms,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let chats_before = store.chats().await.unwrap();
+        assert_eq!(
+            chats_before.len(),
+            1,
+            "seed: one local chat exists before CloudKit sync, got: {:?}",
+            chats_before
+                .iter()
+                .map(|c| (&c.key, &c.participants))
+                .collect::<Vec<_>>()
+        );
+        let seeded_chat_id = chats_before[0].id;
+        let seeded_chat_key = chats_before[0].key.clone();
+
+        // --- 2. Build a from-me CloudKit message for the SAME participant. ---
+        //
+        // The chat_id is the opaque compound value Apple actually uses
+        // ("iMessage;-;+12345"); chat_map is empty so the metadata-backed
+        // path can't resolve the participants and the fallback is exercised.
+        // `sender == my_handle` (matches my_handles) marks this as from-me,
+        // and `destination_caller_id` is the other party's normalized handle.
+        let cloud_time_ns: i64 = 100_000_000_000_000_000;
+        let expected_date_ms = apple_time_to_unix_ms(cloud_time_ns);
+
+        let cm_merge = CloudMessage {
+            utm: None,
+            r#type: 0,
+            error: 0,
+            chat_id: "iMessage;-;+12345".to_string(),
+            sender: my_handle.clone(),
+            time: cloud_time_ns,
+            msg_proto_2: None,
+            destination_caller_id: other_handle.clone(),
+            msg_proto: GZipWrapper(MessageProto {
+                text: Some("from me to you, synced from cloud".to_string()),
+                ..Default::default()
+            }),
+            flags: MessageFlags::IS_FINISHED | MessageFlags::IS_FROM_ME,
+            guid: "ck-from-me-merge".to_string(),
+            msg_proto_3: None,
+            service: "iMessage".to_string(),
+            msg_proto_4: None,
+        };
+
+        let empty_chat_map: HashMap<String, rustpush::cloud_messages::CloudChat> =
+            HashMap::new();
+
+        // --- 3. Convert to Ingest and assert the ChatRef identifies the other
+        //        party (so the merge can happen). ---
+        let ingest_merge = cloud_message_to_ingest(cm_merge, &my_handles, &empty_chat_map);
+        match &ingest_merge {
+            Ingest::Message(m) => {
+                assert!(
+                    m.chat
+                        .participants
+                        .iter()
+                        .any(|p| p == "tel:+12345"),
+                    "fallback ChatRef.participants must include the destination \
+                     'tel:+12345' so the existing local chat merges; got: {:?}",
+                    m.chat.participants,
+                );
+                assert!(
+                    m.chat.participants.iter().any(|p| p == "mailto:me@icloud.com"),
+                    "fallback ChatRef.participants must include 'mailto:me@icloud.com' \
+                     (the from-me sender / my_handle) so the chat is a real 1:1, \
+                     not a self-only chat with an unknown extra participant; \
+                     got: {:?}",
+                    m.chat.participants,
+                );
+                assert!(
+                    !m.chat.participants.iter().any(|p| p.contains(';')),
+                    "fallback ChatRef.participants must NOT contain the raw \
+                     compound chat_id (would be split on ';' into fake labels \
+                     in the UI); got: {:?}",
+                    m.chat.participants,
+                );
+                // Dedup invariant: the resulting ChatRef's key must match the
+                // existing local chat's key (same participants -> same chat).
+                assert_eq!(
+                    m.chat.key(),
+                    seeded_chat_key,
+                    "fallback ChatRef.key() must equal the existing local chat's \
+                     key for the merged from-me CloudKit message; got {}, want {}",
+                    m.chat.key(),
+                    seeded_chat_key,
+                );
+            }
+            other => panic!(
+                "expected Ingest::Message for the from-me CloudKit message, got {:?}",
+                other
+            ),
+        }
+        store.apply(ingest_merge).await.unwrap();
+
+        // --- 4. Verify the chat is preserved (no self-only chat was created)
+        //        and the message landed in the existing chat. ---
+        let chats_after = store.chats().await.unwrap();
+        assert_eq!(
+            chats_after.len(),
+            1,
+            "CloudKit message for an existing participant must merge into the \
+             existing chat, not create a self-only chat; got chats: {:?}",
+            chats_after
+                .iter()
+                .map(|c| (&c.key, &c.participants))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            chats_after[0].id, seeded_chat_id,
+            "chat id must be preserved (the original chat, not a new one)"
+        );
+        assert_eq!(
+            chats_after[0].key, seeded_chat_key,
+            "chat key must be preserved (no self-only re-key)"
+        );
+        // `bump_chat_date` uses max semantics: the chat's `last_message_date`
+        // must reflect the later of (seed, cloud) so an older synced message
+        // does not move the chat backward in the list.
+        assert_eq!(
+            chats_after[0].last_message_date,
+            Some(seed_date_ms.max(expected_date_ms)),
+            "chat last_message_date must be the max of the seed and CloudKit \
+             times (bump_chat_date uses max semantics so an older synced \
+             message does not move the chat backward); got {:?}, want Some({})",
+            chats_after[0].last_message_date,
+            seed_date_ms.max(expected_date_ms),
+        );
+
+        let msgs = store.messages_page(seeded_chat_id, None, 100).await.unwrap();
+        let synced = msgs
+            .iter()
+            .find(|m| m.guid == "ck-from-me-merge")
+            .unwrap_or_else(|| {
+                panic!(
+                    "synced CloudKit message must land in the existing chat; \
+                     got guids: {:?}",
+                    msgs.iter().map(|m| &m.guid).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            synced.date, expected_date_ms,
+            "synced message date must reflect the CloudKit time"
+        );
+        assert!(
+            synced.is_from_me,
+            "synced from-me message must remain is_from_me"
+        );
+        assert_eq!(synced.sender.as_deref(), Some(my_handle.as_str()));
+
+        // --- 5. INVERSE: a CloudKit message for a DIFFERENT participant must
+        //        create its own chat rather than being merged into the existing
+        //        one. ---
+        let cm_diff = CloudMessage {
+            utm: None,
+            r#type: 0,
+            error: 0,
+            chat_id: "iMessage;-;+99999".to_string(),
+            sender: "mailto:alice@example.com".to_string(),
+            time: 200_000_000_000_000_000,
+            msg_proto_2: None,
+            destination_caller_id: String::new(),
+            msg_proto: GZipWrapper(MessageProto {
+                text: Some("hello from alice".to_string()),
+                ..Default::default()
+            }),
+            flags: MessageFlags::IS_FINISHED,
+            guid: "ck-different-participant".to_string(),
+            msg_proto_3: None,
+            service: "iMessage".to_string(),
+            msg_proto_4: None,
+        };
+        let ingest_diff = cloud_message_to_ingest(cm_diff, &my_handles, &empty_chat_map);
+        store.apply(ingest_diff).await.unwrap();
+
+        let chats_final = store.chats().await.unwrap();
+        assert_eq!(
+            chats_final.len(),
+            2,
+            "CloudKit message for a different participant must create its own \
+             chat (not merge into the existing one); got chats: {:?}",
+            chats_final
+                .iter()
+                .map(|c| (&c.key, &c.participants))
+                .collect::<Vec<_>>()
+        );
+
+        // The original chat is still there with its original key.
+        let original_still = chats_final
+            .iter()
+            .find(|c| c.id == seeded_chat_id)
+            .expect("original chat must still exist after a different-participant CloudKit message");
+        assert_eq!(original_still.key, seeded_chat_key);
+
+        // The new chat has alice as a participant and the alice message in it.
+        let new_chats: Vec<_> = chats_final
+            .iter()
+            .filter(|c| c.id != seeded_chat_id)
+            .collect();
+        assert_eq!(new_chats.len(), 1, "exactly one new chat should exist");
+        let alice_chat = new_chats[0];
+        assert!(
+            alice_chat
+                .participants
+                .iter()
+                .any(|p| p.contains("alice")),
+            "new chat must have alice as a participant; got: {:?}",
+            alice_chat.participants
+        );
+        let alice_msgs = store.messages_page(alice_chat.id, None, 100).await.unwrap();
+        let alice_synced = alice_msgs
+            .iter()
+            .find(|m| m.guid == "ck-different-participant")
+            .unwrap_or_else(|| {
+                panic!(
+                    "second CloudKit message must be in the new chat, not the \
+                     original; got guids: {:?}",
+                    alice_msgs.iter().map(|m| &m.guid).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(alice_synced.text.as_deref(), Some("hello from alice"));
+    }
 
     // 1. Apple epoch conversion
     #[test]
@@ -1118,5 +1597,61 @@ mod tests {
         assert!(!path.exists());
         // Idempotent: missing file is not an error.
         clear_last_sync_error(&path).unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // manual_sync_cutoff_ms — pin: manual "Sync Now" / orchestrator callers must
+    // use a bounded ~48h recent-history cutoff, not `i64::MIN` (which would
+    // disable the cap and trigger full-history backfill on every manual press).
+    // ---------------------------------------------------------------------------
+
+    /// 48 hours expressed in milliseconds.
+    const FORTY_EIGHT_HOURS_MS: i64 = 48 * 60 * 60 * 1000;
+
+    #[test]
+    fn manual_sync_cutoff_ms_is_finite_and_recent() {
+        // Arbitrary fixed point in 2023 — supplied explicitly so the test
+        // is deterministic and doesn't depend on wall clock / GTK.
+        let now_ms: i64 = 1_700_000_000_000;
+
+        let cutoff = manual_sync_cutoff_ms(now_ms);
+
+        // 1. The cutoff must NOT be `i64::MIN`. `i64::MIN` is the sentinel
+        //    the UI was previously passing, and it disables the per-page
+        //    "any_older_than_cutoff" cap (`if d < cutoff_ms` in
+        //    process_sync_page) so CloudKit sync would walk the entire
+        //    history on every manual press. Pin that the helper returns a
+        //    finite value.
+        assert_ne!(
+            cutoff, i64::MIN,
+            "manual_sync_cutoff_ms must not return i64::MIN (would disable cutoff)",
+        );
+        assert!(
+            cutoff > i64::MIN,
+            "manual_sync_cutoff_ms must return a finite i64, got {cutoff}",
+        );
+
+        // 2. The cutoff must be approximately 48 hours behind `now_ms`.
+        //    Allow ±1 minute of slack so a future 47h59m or 48h01m tweak
+        //    doesn't break this pin, but reject the "no cutoff / wildly off"
+        //    cases.
+        let expected = now_ms - FORTY_EIGHT_HOURS_MS;
+        let delta = cutoff - expected; // signed: positive ⇒ cutoff newer than expected
+        assert!(
+            delta.abs() <= 60_000,
+            "manual_sync_cutoff_ms({now_ms}) = {cutoff}; expected ≈ {expected} \
+             (now - 48h); delta = {delta} ms, exceeds ±1 min tolerance",
+        );
+
+        // 3. The cutoff must be a function of `now_ms` — shifting `now_ms`
+        //    forward by 1 hour must shift the cutoff forward by exactly 1
+        //    hour. This rules out a hard-coded constant that happens to
+        //    fall inside the ±1 min band by coincidence.
+        let now_ms_plus_1h = now_ms + 3_600_000;
+        let cutoff_plus_1h = manual_sync_cutoff_ms(now_ms_plus_1h);
+        assert_eq!(
+            cutoff_plus_1h, cutoff + 3_600_000,
+            "cutoff must shift 1:1 with now_ms",
+        );
     }
 }
