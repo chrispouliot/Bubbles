@@ -130,30 +130,28 @@ pub fn format_date_label(ms: i64) -> String {
 ///   - The message is the first in the list (`prev` is `None`) and it is
 ///     **not** from today.
 ///   - The message's calendar date is different from the previous message's
-///     calendar date, **and** it is not from today.
+///     calendar date (regardless of whether `current` is today).
 ///
 /// Returns `false` when no divider is needed:
-///   - The message is from today (regardless of `prev`).
-///   - The message's calendar date matches the previous message's date (when
-///     both are non-today; consecutive same-date messages share one divider).
+///   - The message is the first in the list and it **is** from today.
+///   - The message's calendar date matches the previous message's date
+///     (consecutive messages on the same day share one divider, whether
+///     that day is today or a past day).
 ///
 /// Used by the message-list renderer to insert date dividers.
 pub fn should_show_date_divider(prev: Option<i64>, current: i64, now: i64) -> bool {
     let current_date = calendar_date(current);
     let today_date = calendar_date(now);
 
-    // Today's messages never get a date divider.
-    if current_date == today_date {
-        return false;
-    }
-
     match prev {
-        // First message, non-today → divider.
-        None => true,
+        // First message: divider only if it's NOT from today.
+        None => current_date != today_date,
         Some(prev_ms) => {
             let prev_date = calendar_date(prev_ms);
-            // Divider when calendar dates differ (both non-today, since we
-            // already handled the today case above).
+            // Divider when the previous message is from a different calendar
+            // day.  This covers non-today date boundaries, crossing from a
+            // previous day into today, and consecutive-today (same date → no
+            // divider).
             prev_date != current_date
         }
     }
@@ -363,9 +361,9 @@ mod tests {
 
     // --- date divider decision helper ---
     //
-    // Pin: no divider for today's messages; divider for the first non-today
-    // message; divider when crossing between two different non-today dates;
-    // no duplicate divider for consecutive messages on the same non-today
+    // Pin: no divider for an all-today run; divider for the first non-today
+    // message; divider when crossing between two different dates (including
+    // into today); no duplicate divider for consecutive messages on the same
     // date. The "now" timestamp is passed explicitly so the test never depends
     // on real wall-clock time.
 
@@ -406,6 +404,25 @@ mod tests {
         let now = datetime_ms(2024, 6, 15, 12, 0, 0);
         let prev = Some(datetime_ms(2024, 6, 14, 9, 0, 0));
         let current = datetime_ms(2024, 6, 14, 18, 0, 0);
+        assert!(!should_show_date_divider(prev, current, now));
+    }
+
+    /// Crossing from a previous-day message into a current-day message →
+    /// divider, so today's messages are visually separated from earlier days.
+    /// A subsequent today message (prev also today) must still avoid a
+    /// duplicate divider.
+    #[test]
+    fn should_show_date_divider_true_when_crossing_from_previous_day_to_today() {
+        setup_isolated_data_dir();
+        let now = datetime_ms(2024, 6, 15, 12, 0, 0);
+        let prev = Some(datetime_ms(2024, 6, 14, 10, 0, 0));
+        let current = datetime_ms(2024, 6, 15, 8, 0, 0);
+        // prev is yesterday, current is today → need a divider
+        assert!(should_show_date_divider(prev, current, now));
+
+        let prev = Some(current);
+        let current = datetime_ms(2024, 6, 15, 9, 0, 0);
+        // prev is also today → no duplicate divider
         assert!(!should_show_date_divider(prev, current, now));
     }
 }

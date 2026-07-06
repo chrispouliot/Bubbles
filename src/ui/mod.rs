@@ -3594,8 +3594,41 @@ impl Ui {
                         }
                     }
                 }
+                // Capture the old content's first child *before* prepending batch
+                // widgets, so we can insert a boundary divider between the batch
+                // and the existing timeline when they span different calendar days.
+                let old_first_child = ui.msg_container.first_child();
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
+                }
+                // After prepending, if the newest real message in the batch and
+                // the oldest previously-rendered real message are on different
+                // calendar days, insert a date divider at the boundary.  This
+                // covers the case where existing content starts with today and
+                // therefore had no top divider — the boundary now needs one.
+                // We do NOT duplicate an already-present top divider (one that
+                // was already on the old content and survived the removal above).
+                if let Some(old_d) = old_oldest_date {
+                    if let Some(newest_batch) =
+                        older.iter().rev().find(|m| m.associated_guid.is_none())
+                    {
+                        let now = now_ms();
+                        if crate::time_format::should_show_date_divider(
+                            Some(newest_batch.date),
+                            old_d,
+                            now,
+                        ) {
+                            if let Some(ref first) = old_first_child {
+                                if !first.has_css_class("date-divider") {
+                                    let label = crate::time_format::format_date_label(old_d);
+                                    ui.msg_container.insert_before(
+                                        &date_divider(&label),
+                                        Some(first),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 if marker.is_some() {
                     *ui.unread_marker_shown.borrow_mut() = true;
@@ -4870,10 +4903,9 @@ fn build_message_widgets(
             continue;
         }
         // Insert a centered date divider when crossing into a different
-        // non-today calendar date (mirroring populate_messages). When
-        // prev_date is None (start of a batch without prior context),
-        // should_show_date_divider correctly returns true for the first
-        // non-today message.
+        // calendar date (mirroring populate_messages). When prev_date is None
+        // (start of a batch without prior context), should_show_date_divider
+        // correctly returns true for the first non-today message.
         if crate::time_format::should_show_date_divider(prev_date, m.date, now) {
             let label = crate::time_format::format_date_label(m.date);
             out.push(date_divider(&label));
@@ -5037,9 +5069,9 @@ fn populate_messages(
         }
 
         // Insert a centered date divider before the first message of each
-        // non-today calendar date and when crossing into a different non-today
-        // date. No divider for today's messages and no duplicate dividers for
-        // consecutive messages on the same non-today date.
+        // non-today calendar date and when crossing into a different calendar
+        // date. No divider for an all-today run and no duplicate dividers for
+        // consecutive messages on the same date.
         if crate::time_format::should_show_date_divider(prev_date, m.date, now) {
             let label = crate::time_format::format_date_label(m.date);
             container.append(&date_divider(&label));
@@ -9870,4 +9902,3 @@ mod chat_selection_tests {
         assert!(!s.is_selected(2), "clear must forget every prior selection");
     }
 }
-
