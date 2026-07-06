@@ -3296,6 +3296,7 @@ impl Ui {
                             prev_msg,
                             &ui.handles,
                             &ui.contacts.borrow(),
+                            None,
                         );
                         ui.current_chips.borrow_mut().extend(chip_map);
                         *ui.current_reactions.borrow_mut() = reactions.clone();
@@ -3468,6 +3469,12 @@ impl Ui {
         };
         *self.page_loading.borrow_mut() = true;
 
+        // Capture the oldest currently-rendered message's date so that after
+        // building the prepend batch we can detect when the batch's newest
+        // non-today message shares the same calendar date — and remove the
+        // now-redundant date divider from the old content.
+        let old_oldest_date = self.page_oldest.borrow().map(|(date, _id)| date);
+
         let store = self.store.clone();
         let ui = self.clone();
         let chat_id = chat.id;
@@ -3562,9 +3569,31 @@ impl Ui {
                     None,
                     &ui.handles,
                     &ui.contacts.borrow(),
+                    None, // divider_prev_date: let the batch render its own dividers
                 );
                 ui.current_chips.borrow_mut().extend(chip_map);
                 *ui.current_reactions.borrow_mut() = reactions.clone();
+                // If the batch's newest non-today calendar date matches the old
+                // oldest message's date, the old top date divider is now redundant,
+                // because the batch already provides one for that date farther up
+                // the timeline.  Remove it so the date appears only once.
+                if let Some(old_d) = old_oldest_date {
+                    let now = now_ms();
+                    let newest_nontoday = older.iter().rev().find(|m| {
+                        crate::time_format::should_show_date_divider(None, m.date, now)
+                    });
+                    if let Some(nn) = newest_nontoday {
+                        let same_date =
+                            !crate::time_format::should_show_date_divider(Some(old_d), nn.date, now);
+                        if same_date {
+                            if let Some(first) = ui.msg_container.first_child() {
+                                if first.has_css_class("date-divider") {
+                                    ui.msg_container.remove(&first);
+                                }
+                            }
+                        }
+                    }
+                }
                 for w in widgets.into_iter().rev() {
                     ui.msg_container.prepend(&w);
                 }
@@ -4790,6 +4819,11 @@ impl Ui {
 /// When `prev` is `Some`, the group state is seeded from that message so the
 /// first widget in the batch gets the correct spacing relative to its actual
 /// predecessor (not a default "new batch" gap). Used by the `Append` path.
+///
+/// When `divider_prev_date` is `Some`, it overrides the date-divider comparison
+/// date that is normally derived from `prev`. (Currently unused — the prepend
+/// path passes `None` and instead removes any now-redundant old-top date divider
+/// after building, which avoids duplicates without affecting group spacing.)
 #[allow(clippy::too_many_arguments)]
 fn build_message_widgets(
     msgs: &[StoredMessage],
@@ -4804,6 +4838,7 @@ fn build_message_widgets(
     prev: Option<&StoredMessage>,
     handles: &[String],
     contacts: &[Contact],
+    divider_prev_date: Option<i64>,
 ) -> (Vec<gtk::Widget>, Option<gtk::Widget>, std::collections::HashMap<String, ChipEntry>) {
     let mut out = Vec::with_capacity(msgs.len());
     let mut marker: Option<gtk::Widget> = None;
@@ -4812,6 +4847,14 @@ fn build_message_widgets(
         Some(p) => (Some(group_key(p)), p.date, Some(p.is_from_me)),
         None => (None, 0i64, None),
     };
+    // Date-divider tracking: seeded from `divider_prev_date` when present
+    // (prepend path — compares against the adjacent old content's date so
+    // duplicate dividers are avoided when the batch shares a date with
+    // already-rendered messages below), otherwise from `prev` (append path).
+    // When both are `None` (no adjacent context), `should_show_date_divider`
+    // handles the first-non-today case correctly and returns `true`.
+    let now = now_ms();
+    let mut prev_date: Option<i64> = divider_prev_date.or_else(|| prev.map(|p| p.date));
     for m in msgs {
         if marker.is_none() && unread_anchor == Some(m.guid.as_str()) {
             let mk = unread_marker();
@@ -4819,10 +4862,21 @@ fn build_message_widgets(
             marker = Some(mk);
             last_key = None;
             last_from_me = None;
+            // prev_date continues across the unread marker boundary,
+            // matching populate_messages behavior.
         }
         // Skip tapback rows — they render as reaction chips on the target message.
         if m.associated_guid.is_some() {
             continue;
+        }
+        // Insert a centered date divider when crossing into a different
+        // non-today calendar date (mirroring populate_messages). When
+        // prev_date is None (start of a batch without prior context),
+        // should_show_date_divider correctly returns true for the first
+        // non-today message.
+        if crate::time_format::should_show_date_divider(prev_date, m.date, now) {
+            let label = crate::time_format::format_date_label(m.date);
+            out.push(date_divider(&label));
         }
         let key = group_key(m);
         let show_header =
@@ -4861,6 +4915,7 @@ fn build_message_widgets(
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
+        prev_date = Some(m.date);
     }
     (out, marker, chip_map)
 }
@@ -4957,6 +5012,11 @@ fn populate_messages(
     // Skip tapback rows — they render as chips on the target message.
     let last_sent_idx = msgs.iter().rposition(|m| m.is_from_me && m.associated_guid.is_none());
 
+    // Date-divider tracking: the last non-tapback message's timestamp so we
+    // can decide whether a new calendar-date divider is needed.
+    let now = now_ms();
+    let mut prev_date: Option<i64> = None;
+
     for (i, m) in msgs.iter().enumerate() {
         // Tapback rows are rendered as reaction chips on the target message,
         // not as standalone bubbles. Skip them here.
@@ -4974,6 +5034,15 @@ fn populate_messages(
             // Start the unread run with a fresh header.
             last_key = None;
             last_from_me = None;
+        }
+
+        // Insert a centered date divider before the first message of each
+        // non-today calendar date and when crossing into a different non-today
+        // date. No divider for today's messages and no duplicate dividers for
+        // consecutive messages on the same non-today date.
+        if crate::time_format::should_show_date_divider(prev_date, m.date, now) {
+            let label = crate::time_format::format_date_label(m.date);
+            container.append(&date_divider(&label));
         }
 
         let key = group_key(m);
@@ -5032,6 +5101,7 @@ fn populate_messages(
         last_key = Some(key);
         last_date = m.date;
         last_from_me = Some(m.is_from_me);
+        prev_date = Some(m.date);
     }
     (marker, chip_map)
 }
@@ -5244,6 +5314,34 @@ fn unread_marker() -> gtk::Widget {
     left.set_valign(gtk::Align::Center);
     let lbl = gtk::Label::builder().label("New messages").build();
     lbl.add_css_class("unread-marker");
+    apply_text_scale(&lbl, 11.0);
+    let right = gtk::Separator::new(gtk::Orientation::Horizontal);
+    right.set_hexpand(true);
+    right.set_valign(gtk::Align::Center);
+    row.append(&left);
+    row.append(&lbl);
+    row.append(&right);
+    row.upcast()
+}
+
+/// A centered date-separator divider with hairlines on each side.
+/// Used to separate groups of messages from different calendar dates.
+fn date_divider(text: &str) -> gtk::Widget {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(14)
+        .margin_end(14)
+        .margin_top(10)
+        .margin_bottom(2)
+        .build();
+    row.add_css_class("date-divider");
+    let left = gtk::Separator::new(gtk::Orientation::Horizontal);
+    left.set_hexpand(true);
+    left.set_valign(gtk::Align::Center);
+    let lbl = gtk::Label::builder().label(text).build();
+    lbl.add_css_class("dim-label");
+    lbl.add_css_class("caption");
     apply_text_scale(&lbl, 11.0);
     let right = gtk::Separator::new(gtk::Orientation::Horizontal);
     right.set_hexpand(true);
@@ -7079,11 +7177,16 @@ fn bubble_label(
 }
 
 /// A small dim timestamp aligned to the bottom of a bubble.
+/// Hover reveals the full local date + time (respecting 12h/24h setting).
 fn time_label(m: &StoredMessage) -> gtk::Label {
     let l = gtk::Label::builder().label(fmt_time(m.date)).build();
     l.add_css_class("dim-label");
     l.add_css_class("caption");
     l.set_valign(gtk::Align::End);
+    l.set_tooltip_text(Some(&crate::time_format::format_full_timestamp(
+        m.date,
+        crate::time_format::get(),
+    )));
     apply_text_scale(&l, 10.0);
     l
 }
