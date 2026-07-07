@@ -5851,7 +5851,12 @@ fn chat_row(ui: &Ui, c: &ChatSummary) -> gtk::ListBoxRow {
 
     box_.append(avatar.widget());
 
-    let title_label = gtk::Label::new(Some(&title));
+    let title_label = gtk::Label::builder()
+        .label(&title)
+        .max_width_chars(24)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .single_line_mode(true)
+        .build();
     title_label.set_hexpand(true);
     title_label.set_xalign(0.0);
     apply_text_scale(&title_label, 13.0);
@@ -6244,12 +6249,12 @@ fn message_body(
         match att.kind() {
             AttachmentKind::Image => {
                 if let Some(path) = att.local_path.as_deref() {
-                    col.append(&image_widget(path));
+                    col.append(&image_widget(path, att.width.zip(att.height)));
                 }
             }
             AttachmentKind::Video => {
                 if let Some(path) = att.local_path.as_deref() {
-                    col.append(&video_widget(path));
+                    col.append(&video_widget(path, att.width.zip(att.height)));
                 }
             }
             AttachmentKind::Other => {
@@ -6398,15 +6403,86 @@ fn is_heic_path(path: &str) -> bool {
     lower.ends_with(".heic") || lower.ends_with(".heif")
 }
 
+#[derive(Clone)]
+struct CachedThumbnail {
+    texture: gtk::gdk::Texture,
+    width: i32,
+    height: i32,
+}
+
+thread_local! {
+    static THUMBNAIL_CACHE: RefCell<HashMap<String, CachedThumbnail>> = RefCell::new(HashMap::new());
+}
+
+fn thumbnail_size(width: i32, height: i32, max_w: f64, max_h: f64) -> (i32, i32) {
+    let scale = (max_w / width.max(1) as f64)
+        .min(max_h / height.max(1) as f64)
+        .min(1.0);
+    (
+        (width as f64 * scale).round() as i32,
+        (height as f64 * scale).round() as i32,
+    )
+}
+
+fn cached_thumbnail(path: &str) -> Option<CachedThumbnail> {
+    THUMBNAIL_CACHE.with(|cache| cache.borrow().get(path).cloned())
+}
+
+fn store_thumbnail(path: &str, texture: &gtk::gdk::Texture, width: i32, height: i32) {
+    const MAX_CACHED_THUMBNAILS: usize = 128;
+
+    THUMBNAIL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MAX_CACHED_THUMBNAILS && !cache.contains_key(path) {
+            if let Some(key) = cache.keys().next().cloned() {
+                cache.remove(&key);
+            }
+        }
+        cache.insert(
+            path.to_string(),
+            CachedThumbnail {
+                texture: texture.clone(),
+                width,
+                height,
+            },
+        );
+    });
+}
+
+/// After a thumbnail decode changes the widget's size request, shift the
+/// scroll position only if the widget is entirely above the visible viewport.
+fn maybe_adjust_scroll_for_thumbnail(pic: &gtk::Widget, old_h: i32, new_h: i32) {
+    let delta = new_h - old_h;
+    if delta == 0 {
+        return;
+    }
+    let mut cur = pic.parent();
+    while let Some(p) = cur {
+        if let Some(sw) = p.downcast_ref::<gtk::ScrolledWindow>() {
+            let should_anchor = pic
+                .compute_bounds(sw)
+                .map(|r| (r.y() as f64 + r.height() as f64) <= 0.0)
+                .unwrap_or(false);
+            if should_anchor {
+                let adj = sw.vadjustment();
+                adj.set_value((adj.value() + delta as f64).max(0.0));
+            }
+            break;
+        }
+        cur = p.parent();
+    }
+}
+
 /// An image widget that decodes on a background thread and swaps in the
 /// finished texture when ready.  Returns a placeholder immediately so the
 /// chat opens without blocking.
-fn image_widget(path: &str) -> gtk::Widget {
+fn image_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::Widget {
     const CHAT_THUMBNAIL_MAX_EDGE: u32 = 1024;
+    const MAX_W: f64 = 260.0;
+    const MAX_H: f64 = 340.0;
 
     let pic = gtk::Picture::new();
-    let (max_w, max_h) = (260.0, 340.0);
-    pic.set_size_request(max_w as i32, max_h as i32);
+    pic.set_size_request(MAX_W as i32, MAX_H as i32);
     pic.set_content_fit(gtk::ContentFit::Contain);
     pic.set_overflow(gtk::Overflow::Hidden);
     pic.add_css_class("attachment-image");
@@ -6415,40 +6491,59 @@ fn image_widget(path: &str) -> gtk::Widget {
     // Owned for the 'static decode callback below.
     let path_string = path.to_string();
 
+    if let Some((width, height)) = dimensions {
+        let (thumb_w, thumb_h) = thumbnail_size(width, height, MAX_W, MAX_H);
+        pic.set_size_request(thumb_w, thumb_h);
+    }
+
+    let has_cached_thumbnail = if let Some(cached) = cached_thumbnail(path) {
+        pic.set_size_request(cached.width, cached.height);
+        pic.set_paintable(Some(&cached.texture));
+        true
+    } else {
+        false
+    };
+
     // Schedule background decode via the image scheduler.
-    let weak = pic.downgrade();
-    crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], Some(CHAT_THUMBNAIL_MAX_EDGE), {
-        move |result| {
-            if let Some(pic) = weak.upgrade() {
-                match result {
-                    Ok(decoded) => {
-                        let w = decoded.width as i32;
-                        let h = decoded.height as i32;
-                        let bytes = glib::Bytes::from_owned(decoded.pixels);
-                        let texture = gtk::gdk::MemoryTexture::new(
-                            w,
-                            h,
-                            gtk::gdk::MemoryFormat::R8g8b8a8,
-                            &bytes,
-                            w as usize * 4,
-                        )
-                        .upcast::<gtk::gdk::Texture>();
-                        pic.set_paintable(Some(&texture));
-                        // Re-size based on actual image dimensions, capped.
-                        let scale = (max_w / w.max(1) as f64)
-                            .min(max_h / h.max(1) as f64)
-                            .min(1.0);
-                        pic.set_size_request(
-                            (w as f64 * scale).round() as i32,
-                            (h as f64 * scale).round() as i32,
-                        );
-                        log::debug!("image thumbnail decoded: {w}x{h} for {path_string}");
+    if !has_cached_thumbnail {
+        let weak = pic.downgrade();
+        crate::image::schedule_image_loads(vec![std::path::PathBuf::from(path)], Some(CHAT_THUMBNAIL_MAX_EDGE), {
+            move |result| {
+                if let Some(pic) = weak.upgrade() {
+                    match result {
+                        Ok(decoded) => {
+                            let w = decoded.width as i32;
+                            let h = decoded.height as i32;
+                            let bytes = glib::Bytes::from_owned(decoded.pixels);
+                            let texture = gtk::gdk::MemoryTexture::new(
+                                w,
+                                h,
+                                gtk::gdk::MemoryFormat::R8g8b8a8,
+                                &bytes,
+                                w as usize * 4,
+                            )
+                            .upcast::<gtk::gdk::Texture>();
+                            let (new_w, new_h) = thumbnail_size(w, h, MAX_W, MAX_H);
+
+                            let old_h = pic.height_request();
+                            pic.set_size_request(new_w, new_h);
+                            if old_h != new_h {
+                                maybe_adjust_scroll_for_thumbnail(
+                                    pic.upcast_ref(),
+                                    old_h,
+                                    new_h,
+                                );
+                            }
+                            pic.set_paintable(Some(&texture));
+                            store_thumbnail(&path_string, &texture, new_w, new_h);
+                            log::debug!("image thumbnail decoded: {w}x{h} for {path_string}");
+                        }
+                        Err(e) => log::warn!("image thumbnail decode failed for {path_string}: {e}"),
                     }
-                    Err(e) => log::warn!("image thumbnail decode failed for {path_string}: {e}"),
                 }
             }
-        }
-    });
+        });
+    }
 
     // Click to enlarge: find the lightbox host overlay and layer the full image.
     let gesture = gtk::GestureClick::new();
@@ -6474,12 +6569,13 @@ fn image_widget(path: &str) -> gtk::Widget {
 /// A video thumbnail widget that decodes a single frame on a background thread
 /// and swaps in the finished texture when ready.  Returns a placeholder with a
 /// centered play-button overlay immediately so the chat opens without blocking.
-fn video_widget(path: &str) -> gtk::Widget {
+fn video_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::Widget {
     const CHAT_THUMBNAIL_MAX_EDGE: u32 = 1024;
+    const MAX_W: f64 = 260.0;
+    const MAX_H: f64 = 340.0;
 
     let pic = gtk::Picture::new();
-    let (max_w, max_h) = (260.0, 340.0);
-    pic.set_size_request(max_w as i32, max_h as i32);
+    pic.set_size_request(MAX_W as i32, MAX_H as i32);
     pic.set_content_fit(gtk::ContentFit::Contain);
     pic.set_overflow(gtk::Overflow::Hidden);
     pic.add_css_class("attachment-image");
@@ -6496,46 +6592,68 @@ fn video_widget(path: &str) -> gtk::Widget {
     play_icon.set_halign(gtk::Align::Center);
     play_icon.set_valign(gtk::Align::Center);
 
-    // Schedule background decode via the video scheduler.
-    let weak = pic.downgrade();
     // Owned for the 'static decode callback below.
     let path_string = path.to_string();
-    crate::video::schedule_video_thumbnails(
-        vec![std::path::PathBuf::from(path)],
-        CHAT_THUMBNAIL_MAX_EDGE,
-        {
-            move |result| {
-                if let Some(pic) = weak.upgrade() {
-                    match result {
-                        Ok(decoded) => {
-                            let w = decoded.width as i32;
-                            let h = decoded.height as i32;
-                            let bytes = glib::Bytes::from_owned(decoded.pixels);
-                            let texture = gtk::gdk::MemoryTexture::new(
-                                w,
-                                h,
-                                gtk::gdk::MemoryFormat::R8g8b8a8,
-                                &bytes,
-                                w as usize * 4,
-                            )
-                            .upcast::<gtk::gdk::Texture>();
-                            pic.set_paintable(Some(&texture));
-                            // Re-size based on actual image dimensions, capped.
-                            let scale = (max_w / w.max(1) as f64)
-                                .min(max_h / h.max(1) as f64)
-                                .min(1.0);
-                            pic.set_size_request(
-                                (w as f64 * scale).round() as i32,
-                                (h as f64 * scale).round() as i32,
-                            );
-                            log::debug!("video thumbnail decoded: {w}x{h} for {path_string}");
+
+    if let Some((width, height)) = dimensions {
+        let (thumb_w, thumb_h) = thumbnail_size(width, height, MAX_W, MAX_H);
+        pic.set_size_request(thumb_w, thumb_h);
+    }
+
+    let has_cached_thumbnail = if let Some(cached) = cached_thumbnail(path) {
+        pic.set_size_request(cached.width, cached.height);
+        pic.set_paintable(Some(&cached.texture));
+        true
+    } else {
+        false
+    };
+
+    // Schedule background decode via the video scheduler.
+    if !has_cached_thumbnail {
+        let weak = pic.downgrade();
+        crate::video::schedule_video_thumbnails(
+            vec![std::path::PathBuf::from(path)],
+            CHAT_THUMBNAIL_MAX_EDGE,
+            {
+                move |result| {
+                    if let Some(pic) = weak.upgrade() {
+                        match result {
+                            Ok(decoded) => {
+                                let w = decoded.width as i32;
+                                let h = decoded.height as i32;
+                                let bytes = glib::Bytes::from_owned(decoded.pixels);
+                                let texture = gtk::gdk::MemoryTexture::new(
+                                    w,
+                                    h,
+                                    gtk::gdk::MemoryFormat::R8g8b8a8,
+                                    &bytes,
+                                    w as usize * 4,
+                                )
+                                .upcast::<gtk::gdk::Texture>();
+                                let (new_w, new_h) = thumbnail_size(w, h, MAX_W, MAX_H);
+
+                                let old_h = pic.height_request();
+                                pic.set_size_request(new_w, new_h);
+                                if old_h != new_h {
+                                    maybe_adjust_scroll_for_thumbnail(
+                                        pic.upcast_ref(),
+                                        old_h,
+                                        new_h,
+                                    );
+                                }
+                                pic.set_paintable(Some(&texture));
+                                store_thumbnail(&path_string, &texture, new_w, new_h);
+                                log::debug!("video thumbnail decoded: {w}x{h} for {path_string}");
+                            }
+                            Err(e) => {
+                                log::warn!("video thumbnail decode failed for {path_string}: {e}")
+                            }
                         }
-                        Err(e) => log::warn!("video thumbnail decode failed for {path_string}: {e}"),
                     }
                 }
-            }
-        },
-    );
+            },
+        );
+    }
 
     // Click to enlarge: find the lightbox host overlay and open the video
     // lightbox.
@@ -8192,6 +8310,8 @@ mod extract_target_text_tests {
             mime: None,
             name: name.map(str::to_string),
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         }
     }

@@ -208,6 +208,8 @@ pub struct StoredAttachment {
     pub mime: Option<String>,
     pub name: Option<String>,
     pub local_path: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     #[allow(dead_code)]
     pub is_sticker: bool,
 }
@@ -482,6 +484,8 @@ mod tests {
             mime: Some("video/mp4".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(att.is_video());
@@ -493,6 +497,8 @@ mod tests {
             mime: Some("video/quicktime".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(att.is_video());
@@ -504,6 +510,8 @@ mod tests {
             mime: Some("video/hevc".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(att.is_video());
@@ -515,6 +523,8 @@ mod tests {
             mime: Some("video/heic".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(att.is_video());
@@ -530,6 +540,8 @@ mod tests {
             mime: Some("image/jpeg".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -541,6 +553,8 @@ mod tests {
             mime: Some("image/png".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -553,6 +567,8 @@ mod tests {
             mime: Some("image/heic".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -568,6 +584,8 @@ mod tests {
             mime: Some("application/pdf".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -579,6 +597,8 @@ mod tests {
             mime: Some("text/plain".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -590,6 +610,8 @@ mod tests {
             mime: Some("audio/mpeg".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -605,6 +627,8 @@ mod tests {
             mime: None,
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_video());
@@ -620,6 +644,8 @@ mod tests {
             mime: Some("image/jpeg".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(att.is_image());
@@ -631,6 +657,8 @@ mod tests {
             mime: Some("video/mp4".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert!(!att.is_image());
@@ -646,6 +674,8 @@ mod tests {
             mime: Some("image/jpeg".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Image);
@@ -657,6 +687,8 @@ mod tests {
             mime: Some("video/mp4".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Video);
@@ -668,6 +700,8 @@ mod tests {
             mime: Some("video/quicktime".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Video);
@@ -679,6 +713,8 @@ mod tests {
             mime: Some("video/hevc".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Video);
@@ -690,6 +726,8 @@ mod tests {
             mime: Some("application/pdf".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Other);
@@ -701,6 +739,8 @@ mod tests {
             mime: Some("audio/mpeg".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Other);
@@ -712,6 +752,8 @@ mod tests {
             mime: None,
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Other);
@@ -724,6 +766,8 @@ mod tests {
             mime: Some("image/heic".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Image);
@@ -735,6 +779,8 @@ mod tests {
             mime: Some("image/png".into()),
             name: None,
             local_path: None,
+            width: None,
+            height: None,
             is_sticker: false,
         };
         assert_eq!(att.kind(), AttachmentKind::Image);

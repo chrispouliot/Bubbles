@@ -174,8 +174,41 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         c.execute_batch(DDL_V7)?;
         v = 7;
     }
+    if v < 8 {
+        // Cached media dimensions let the chat allocate attachment thumbnails at
+        // their final aspect-ratio size before async decode swaps in pixels.
+        c.execute_batch(
+            "ALTER TABLE attachment ADD COLUMN width INTEGER;
+             ALTER TABLE attachment ADD COLUMN height INTEGER;",
+        )?;
+        v = 8;
+    }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
+}
+
+fn attachment_dimensions_for(
+    mime: Option<&str>,
+    local_path: Option<&str>,
+) -> (Option<i32>, Option<i32>) {
+    let Some(path) = local_path else {
+        return (None, None);
+    };
+    let path = Path::new(path);
+    let decoded = if mime.is_some_and(|m| m.starts_with("image/")) {
+        crate::image::decode_image_rgba(path, Some(1024)).ok()
+    } else if mime.is_some_and(|m| m.starts_with("video/")) {
+        crate::video::decode_video_thumbnail_rgba(path, 1024).ok()
+    } else {
+        None
+    };
+    decoded
+        .map(|d| (Some(d.width as i32), Some(d.height as i32)))
+        .unwrap_or((None, None))
+}
+
+fn attachment_dimensions(a: &AttachmentRecord) -> (Option<i32>, Option<i32>) {
+    attachment_dimensions_for(a.mime.as_deref(), a.local_path.as_deref())
 }
 
 /// The most recent inbound message in `chat_id` we have not yet acknowledged
@@ -296,14 +329,15 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
     if newly_inserted && !m.attachments.is_empty() {
         let msg_id = c.last_insert_rowid();
         for a in &m.attachments {
+            let (width, height) = attachment_dimensions(a);
             c.execute(
                 "INSERT INTO attachment
-                   (message_id, guid, mime_type, transfer_name, total_bytes,
-                    local_path, part_index, is_sticker)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    (message_id, guid, mime_type, transfer_name, total_bytes,
+                     local_path, width, height, part_index, is_sticker)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     msg_id, a.guid, a.mime, a.name, a.total_bytes,
-                    a.local_path, a.part_index, a.is_sticker as i64
+                    a.local_path, width, height, a.part_index, a.is_sticker as i64
                 ],
             )?;
         }
@@ -600,24 +634,42 @@ fn load_attachments(
     }
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT a.message_id, a.mime_type, a.transfer_name, a.local_path, a.is_sticker
+        "SELECT a.id, a.message_id, a.mime_type, a.transfer_name, a.local_path, a.is_sticker,
+                a.width, a.height
          FROM attachment a WHERE a.message_id IN ({placeholders})
          ORDER BY a.part_index ASC, a.id ASC"
     );
     let mut astmt = c.prepare(&sql)?;
-    let arows = astmt.query_map(params_from_iter(ids.iter()), |r| {
+    let rows = astmt.query_map(params_from_iter(ids.iter()), |r| {
         Ok((
             r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
             StoredAttachment {
-                mime: r.get(1)?,
-                name: r.get(2)?,
-                local_path: r.get(3)?,
-                is_sticker: r.get::<_, i64>(4)? != 0,
+                mime: r.get(2)?,
+                name: r.get(3)?,
+                local_path: r.get(4)?,
+                is_sticker: r.get::<_, i64>(5)? != 0,
+                width: r.get(6)?,
+                height: r.get(7)?,
             },
         ))
     })?;
-    for row in arows {
-        let (mid, att) = row?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(astmt);
+    for row in rows {
+        let (attachment_id, mid, mut att) = row;
+        if att.width.is_none() || att.height.is_none() {
+            let (width, height) =
+                attachment_dimensions_for(att.mime.as_deref(), att.local_path.as_deref());
+            if width.is_some() && height.is_some() {
+                c.execute(
+                    "UPDATE attachment SET width = ?1, height = ?2 WHERE id = ?3",
+                    params![width, height, attachment_id],
+                )?;
+                att.width = width;
+                att.height = height;
+            }
+        }
         by_msg.entry(mid).or_default().push(att);
     }
     Ok(by_msg)
@@ -2200,12 +2252,12 @@ mod tests {
         );
 
         // Assert user_version bumped through all migrations applied from a v4
-        // base (v5, v6, v7, …). Update this expected value whenever a new
+        // base (v5, v6, v7, v8, …). Update this expected value whenever a new
         // migration arm is added to `migrate()`.
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7, "user_version must be 7 after migration from a v4 base");
+        assert_eq!(v, 8, "user_version must be 8 after migration from a v4 base");
     }
 
     #[test]
@@ -2801,12 +2853,29 @@ mod tests {
     }
 
     #[test]
-    fn migration_bumps_user_version_to_7() {
+    fn migration_bumps_user_version_to_8() {
         let c = db();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7, "migration must bump user_version to 7");
+        assert_eq!(v, 8, "migration must bump user_version to 8");
+
+        let width_col: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('attachment') WHERE name = 'width'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let height_col: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('attachment') WHERE name = 'height'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(width_col, 1, "attachment.width must exist after migration");
+        assert_eq!(height_col, 1, "attachment.height must exist after migration");
     }
 
     // -------------------------------------------------------------------
