@@ -224,6 +224,40 @@ fn is_address_book(data: &str) -> bool {
 // vCard 3.0 parser
 // ---------------------------------------------------------------------------
 
+/// Try to read a `file://` URI from a `PHOTO;VALUE=URI` field and return the
+/// file bytes.  Returns `None` if the URI is not a local file URI or cannot
+/// be read — callers should degrade gracefully.
+///
+/// Only genuinely local file URIs are accepted:
+/// `file:///absolute/path` (empty authority), `file://localhost/path`,
+/// `file://127.0.0.1/path`, and `file://[::1]/path`.  Any other hostname
+/// silently yields `None` — no panics, no contact-parse failure.
+fn read_photo_from_file_uri(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix("file://")?;
+
+    let path: std::path::PathBuf = if rest.starts_with('/') {
+        // "file:///absolute/path" — authority is empty, path is absolute.
+        std::path::PathBuf::from(rest)
+    } else {
+        // Has an authority component (hostname).  Only localhost/loopback
+        // is accepted; everything else is treated as a remote URI.
+        let slash = rest.find('/')?;
+        let host = &rest[..slash];
+        let path = &rest[slash..];
+
+        let is_local = host.is_empty()
+            || host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host == "[::1]"
+            || host == "::1";
+        if !is_local {
+            return None;
+        }
+        std::path::PathBuf::from(path)
+    };
+    std::fs::read(path).ok()
+}
+
 /// Parse a vCard 3.0 string into a [`Contact`].
 ///
 /// Returns `None` if the vCard lacks a `UID` property (every EDS contact
@@ -283,6 +317,11 @@ fn parse_vcard(vcard: &str) -> Option<Contact> {
                     if !decoded.is_empty() {
                         avatar = Some(decoded);
                     }
+                } else if upper_header.contains("VALUE=URI") {
+                    // PHOTO;VALUE=URI:file://... — read the local file.
+                    if let Some(bytes) = read_photo_from_file_uri(value) {
+                        avatar = Some(bytes);
+                    }
                 }
             }
             _ => {}
@@ -331,4 +370,137 @@ fn unfold_vcard(vcard: &str) -> String {
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Parse a vCard whose PHOTO is a `VALUE=URI` pointing to a local file.
+    /// The parser must read the file and set `avatar` to its bytes.
+    #[test]
+    fn parse_vcard_reads_photo_from_file_uri() {
+        // Strict per-test isolation: fresh temp dir for the image file.
+        let dir = TempDir::new().unwrap();
+        let avatar_path = dir.path().join("avatar.png");
+        let image_bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec(); // valid PNG header
+        fs::write(&avatar_path, &image_bytes).unwrap();
+
+        // Construct a vCard 3.0 with a PHOTO;VALUE=URI:file://... line.
+        let uri = format!("file://{}", avatar_path.display());
+        let vcard = format!(
+            "\
+BEGIN:VCARD
+VERSION:3.0
+FN:Test Contact
+UID:test-uid-42
+PHOTO;VALUE=URI:{}
+END:VCARD",
+            uri
+        );
+
+        let contact = parse_vcard(&vcard).expect("vCard should parse as Contact");
+
+        assert!(
+            contact.avatar.is_some(),
+            "expected avatar to be read from PHOTO;VALUE=URI file://…, got None"
+        );
+        assert_eq!(
+            contact.avatar.unwrap(),
+            image_bytes,
+            "avatar bytes must match the content of the PHOTO file"
+        );
+    }
+
+    /// Regression: a non-local host in the file URI must NOT be treated as
+    /// local — the parser silently returns None rather than reading a local
+    /// path derived from a remote hostname.
+    #[test]
+    fn read_photo_rejects_non_local_host() {
+        // file:// remote-host/path — must NOT produce avatar bytes.
+        let vcard = "\
+BEGIN:VCARD
+VERSION:3.0
+FN:Remote Contact
+UID:test-uid-remote-99
+PHOTO;VALUE=URI:file://some-remote-host/etc/passwd
+END:VCARD";
+
+        let contact = parse_vcard(vcard).expect("vCard should parse as Contact");
+        assert!(
+            contact.avatar.is_none(),
+            "expected no avatar for file:// with non-local host, got Some"
+        );
+    }
+
+    /// file://localhost/path is genuinely local and SHOULD be read.
+    #[test]
+    fn read_photo_accepts_localhost_host() {
+        let dir = TempDir::new().unwrap();
+        let avatar_path = dir.path().join("avatar_localhost.png");
+        let image_bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+        fs::write(&avatar_path, &image_bytes).unwrap();
+
+        // Use a file://localhost/... URI.
+        let uri = format!("file://localhost{}", avatar_path.display());
+        let vcard = format!(
+            "\
+BEGIN:VCARD
+VERSION:3.0
+FN:Localhost Contact
+UID:test-uid-localhost-42
+PHOTO;VALUE=URI:{}
+END:VCARD",
+            uri
+        );
+
+        let contact = parse_vcard(&vcard).expect("vCard should parse as Contact");
+        assert!(
+            contact.avatar.is_some(),
+            "expected avatar for file://localhost/…, got None"
+        );
+        assert_eq!(
+            contact.avatar.unwrap(),
+            image_bytes,
+            "avatar bytes must match the content of the PHOTO file for localhost URI"
+        );
+    }
+
+    /// file://127.0.0.1/path is also local and SHOULD be read.
+    #[test]
+    fn read_photo_accepts_loopback_ip() {
+        let dir = TempDir::new().unwrap();
+        let avatar_path = dir.path().join("avatar_loopback.png");
+        let image_bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+        fs::write(&avatar_path, &image_bytes).unwrap();
+
+        let uri = format!("file://127.0.0.1{}", avatar_path.display());
+        let vcard = format!(
+            "\
+BEGIN:VCARD
+VERSION:3.0
+FN:Loopback Contact
+UID:test-uid-loopback-42
+PHOTO;VALUE=URI:{}
+END:VCARD",
+            uri
+        );
+
+        let contact = parse_vcard(&vcard).expect("vCard should parse as Contact");
+        assert!(
+            contact.avatar.is_some(),
+            "expected avatar for file://127.0.0.1/…, got None"
+        );
+        assert_eq!(
+            contact.avatar.unwrap(),
+            image_bytes,
+            "avatar bytes must match for loopback URI"
+        );
+    }
 }
