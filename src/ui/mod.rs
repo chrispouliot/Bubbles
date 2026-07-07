@@ -6584,7 +6584,6 @@ fn show_lightbox(host: &gtk::Overlay, path: &str) {
     dim.add_css_class("lightbox-dim");
     dim.set_hexpand(true);
     dim.set_vexpand(true);
-    dim.set_focusable(true);
 
     let pic = gtk::Picture::new();
     pic.set_paintable(Some(&texture));
@@ -6598,29 +6597,46 @@ fn show_lightbox(host: &gtk::Overlay, path: &str) {
     pic.set_margin_end(32);
     dim.append(&pic);
 
-    // Click anywhere on the dim layer dismisses.
-    let click = gtk::GestureClick::new();
-    let host_c = host.clone();
-    let dim_c = dim.clone();
-    click.connect_released(move |_, _, _, _| host_c.remove_overlay(&dim_c));
-    dim.add_controller(click);
+    // Toplevel window for reliable key event capture.
+    let toplevel = host.root().and_then(|r| r.downcast::<gtk::Window>().ok());
 
-    // Escape dismisses.
+    // Escape handler on the toplevel window in Capture phase.
+    // Capture fires before focus routing, so focus location doesn't matter.
     let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let keys_for_click = keys.clone();
     let host_k = host.clone();
     let dim_k = dim.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
+    let tl_esc = toplevel.clone();
+    keys.connect_key_pressed(move |ctrl, key, _, _| {
+        if key == gtk::gdk::Key::Escape && dim_k.parent().is_some() {
+            if let Some(ref win) = tl_esc {
+                win.remove_controller(ctrl);
+            }
             host_k.remove_overlay(&dim_k);
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
         }
     });
-    dim.add_controller(keys);
+    if let Some(ref win) = toplevel {
+        win.add_controller(keys);
+    }
+
+    // Click on the dim layer dismisses (also removes the key controller).
+    let click = gtk::GestureClick::new();
+    let host_c = host.clone();
+    let dim_c = dim.clone();
+    let tl_click = toplevel.clone();
+    click.connect_released(move |_, _, _, _| {
+        if let Some(ref win) = tl_click {
+            win.remove_controller(&keys_for_click);
+        }
+        host_c.remove_overlay(&dim_c);
+    });
+    dim.add_controller(click);
 
     host.add_overlay(&dim);
-    dim.grab_focus();
 }
 
 /// Open the fullscreen viewer for a video at `path`. Auto-plays with audio.
@@ -6660,7 +6676,6 @@ fn show_video_lightbox(host: &gtk::Overlay, path: &str) {
     dim.add_css_class("lightbox-dim");
     dim.set_hexpand(true);
     dim.set_vexpand(true);
-    dim.set_focusable(true);
 
     let pic = gtk::Picture::new();
     pic.set_paintable(Some(&paintable));
@@ -6692,37 +6707,53 @@ fn show_video_lightbox(host: &gtk::Overlay, path: &str) {
     });
     pic.add_controller(toggle_gesture);
 
-    // Click on the dim background (outside the picture) dismisses.
-    // Default Bubble phase fires for clicks on the dim's empty area;
-    // clicks on the picture are caught in Capture phase by toggle_gesture above.
-    let dismiss_gesture = gtk::GestureClick::new();
-    let host_c = host.clone();
-    let dim_c = dim.clone();
-    let pb_dismiss = playbin.clone();
-    dismiss_gesture.connect_released(move |_, _, _, _| {
-        let _ = pb_dismiss.set_state(gst::State::Null);
-        host_c.remove_overlay(&dim_c);
-    });
-    dim.add_controller(dismiss_gesture);
+    // Toplevel window for reliable key event capture.
+    let toplevel = host.root().and_then(|r| r.downcast::<gtk::Window>().ok());
 
-    // Escape key dismisses.
+    // Escape handler on the toplevel window in Capture phase.
+    // Capture fires before focus routing, so focus location doesn't matter.
     let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let keys_for_dismiss = keys.clone();
     let host_k = host.clone();
     let dim_k = dim.clone();
     let pb_esc = playbin.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
+    let tl_esc = toplevel.clone();
+    keys.connect_key_pressed(move |ctrl, key, _, _| {
+        if key == gtk::gdk::Key::Escape && dim_k.parent().is_some() {
             let _ = pb_esc.set_state(gst::State::Null);
+            if let Some(ref win) = tl_esc {
+                win.remove_controller(ctrl);
+            }
             host_k.remove_overlay(&dim_k);
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
         }
     });
-    dim.add_controller(keys);
+    if let Some(ref win) = toplevel {
+        win.add_controller(keys);
+    }
+
+    // Click on the dim background (outside the picture) dismisses, also
+    // removes the key controller. Default Bubble phase fires for clicks on
+    // the dim's empty area; clicks on the picture are caught in Capture
+    // phase by toggle_gesture above.
+    let dismiss_gesture = gtk::GestureClick::new();
+    let host_c = host.clone();
+    let dim_c = dim.clone();
+    let pb_dismiss = playbin.clone();
+    let tl_click = toplevel.clone();
+    dismiss_gesture.connect_released(move |_, _, _, _| {
+        let _ = pb_dismiss.set_state(gst::State::Null);
+        if let Some(ref win) = tl_click {
+            win.remove_controller(&keys_for_dismiss);
+        }
+        host_c.remove_overlay(&dim_c);
+    });
+    dim.add_controller(dismiss_gesture);
 
     host.add_overlay(&dim);
-    dim.grab_focus();
 }
 
 // --- link preview card ---
