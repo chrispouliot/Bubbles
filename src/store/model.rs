@@ -69,6 +69,10 @@ pub struct AttachmentRecord {
     pub local_path: Option<String>,
     pub part_index: Option<i64>,
     pub is_sticker: bool,
+    /// True when rustpush decoded this file as part of an Apple Live Photo.
+    pub is_live_photo: bool,
+    /// Stable key shared by the still and motion files of one Live Photo.
+    pub pairing_id: Option<String>,
 }
 
 /// A delivery/read receipt updating an existing message (referenced by its guid).
@@ -212,6 +216,10 @@ pub struct StoredAttachment {
     pub height: Option<i32>,
     #[allow(dead_code)]
     pub is_sticker: bool,
+    #[allow(dead_code)]
+    pub is_live_photo: bool,
+    #[allow(dead_code)]
+    pub pairing_id: Option<String>,
 }
 
 impl StoredAttachment {
@@ -251,6 +259,70 @@ pub enum AttachmentKind {
     Image,
     Video,
     Other,
+}
+
+/// One logical attachment item. A Live Photo is represented by its still and
+/// motion files together; ordinary attachments remain one item each.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub enum AttachmentGroup {
+    Single(StoredAttachment),
+    LivePhoto {
+        still: StoredAttachment,
+        motion: StoredAttachment,
+    },
+}
+
+fn attachment_pairing_id(attachment: &StoredAttachment) -> Option<&str> {
+    attachment.pairing_id.as_deref().or_else(|| {
+        std::path::Path::new(attachment.name.as_deref()?)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+    })
+}
+
+/// Group matching Live Photo files while retaining the input order of logical
+/// items. Files are paired only when either carries the decoded Live Photo flag
+/// and both share a pairing key, so unrelated attachments are untouched.
+#[allow(dead_code)]
+pub fn group_attachments(attachments: &[StoredAttachment]) -> Vec<AttachmentGroup> {
+    let mut groups = Vec::new();
+
+    for attachment in attachments {
+        let pair_index = groups.iter().position(|group| {
+            let AttachmentGroup::Single(existing) = group else {
+                return false;
+            };
+            let pairing_matches = attachment_pairing_id(attachment)
+                .zip(attachment_pairing_id(existing))
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right));
+            (attachment.is_live_photo || existing.is_live_photo)
+                && pairing_matches
+                && ((attachment.is_image() && existing.is_video())
+                    || (attachment.is_video() && existing.is_image()))
+        });
+
+        if let Some(index) = pair_index {
+            let existing = match std::mem::replace(
+                &mut groups[index],
+                AttachmentGroup::Single(attachment.clone()),
+            ) {
+                AttachmentGroup::Single(existing) => existing,
+                AttachmentGroup::LivePhoto { .. } => unreachable!(),
+            };
+            let (still, motion) = if existing.is_image() {
+                (existing, attachment.clone())
+            } else {
+                (attachment.clone(), existing)
+            };
+            groups[index] = AttachmentGroup::LivePhoto { still, motion };
+        } else {
+            groups.push(AttachmentGroup::Single(attachment.clone()));
+        }
+    }
+
+    groups
 }
 
 /// A sender-generated URL preview, attached to a specific message. This is the
@@ -487,6 +559,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(att.is_video());
     }
@@ -500,6 +574,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(att.is_video());
     }
@@ -513,6 +589,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(att.is_video());
     }
@@ -526,6 +604,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(att.is_video());
     }
@@ -543,6 +623,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -556,6 +638,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -570,6 +654,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -587,6 +673,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -600,6 +688,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -613,6 +703,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -630,6 +722,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_video());
     }
@@ -647,6 +741,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(att.is_image());
     }
@@ -660,6 +756,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert!(!att.is_image());
     }
@@ -677,6 +775,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Image);
     }
@@ -690,6 +790,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Video);
     }
@@ -703,6 +805,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Video);
     }
@@ -716,6 +820,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Video);
     }
@@ -729,6 +835,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Other);
     }
@@ -742,6 +850,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Other);
     }
@@ -755,6 +865,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Other);
     }
@@ -769,6 +881,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Image);
     }
@@ -782,6 +896,8 @@ mod tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         };
         assert_eq!(att.kind(), AttachmentKind::Image);
     }

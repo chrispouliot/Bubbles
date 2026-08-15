@@ -175,6 +175,25 @@ fn maybe_adjust_scroll_for_thumbnail(pic: &gtk::Widget, old_h: i32, new_h: i32) 
 /// finished texture when ready.  Returns a placeholder immediately so the
 /// chat opens without blocking.
 pub(super) fn image_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::Widget {
+    image_widget_with_motion(path, dimensions, None)
+}
+
+/// An image widget with an optional paired motion file.  The still remains the
+/// primary click target; when a motion file is present, a separate corner
+/// button opens the video lightbox without changing the still's click behavior.
+pub(super) fn live_photo_widget(
+    still_path: &str,
+    motion_path: &str,
+    dimensions: Option<(i32, i32)>,
+) -> gtk::Widget {
+    image_widget_with_motion(still_path, dimensions, Some(motion_path))
+}
+
+fn image_widget_with_motion(
+    path: &str,
+    dimensions: Option<(i32, i32)>,
+    motion_path: Option<&str>,
+) -> gtk::Widget {
     const CHAT_THUMBNAIL_MAX_EDGE: u32 = 1024;
     const MAX_W: f64 = 260.0;
     const MAX_H: f64 = 340.0;
@@ -246,6 +265,7 @@ pub(super) fn image_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::W
     // Click to enlarge: find the lightbox host overlay and layer the full image.
     let gesture = gtk::GestureClick::new();
     let path_owned = path.to_string();
+    let motion_path_owned = motion_path.map(str::to_owned);
     let pic_weak = pic.downgrade();
     gesture.connect_released(move |_, _, _, _| {
         log::debug!("image click handler fired for {path_owned}");
@@ -257,11 +277,96 @@ pub(super) fn image_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::W
             log::debug!("image click: find_lightbox_host returned None for {path_owned}");
             return;
         };
-        show_lightbox(&host, &path_owned);
+        show_lightbox(&host, &path_owned, motion_path_owned.as_deref());
     });
     pic.add_controller(gesture);
 
-    pic.upcast()
+    let Some(motion_path) = motion_path else {
+        return pic.upcast();
+    };
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&pic));
+
+    let live_button = gtk::Button::from_icon_name("media-playback-start-symbolic");
+    live_button.add_css_class("live-photo-button");
+    live_button.set_tooltip_text(Some("Play Live Photo"));
+    live_button.set_halign(gtk::Align::End);
+    live_button.set_valign(gtk::Align::End);
+    live_button.set_margin_end(8);
+    live_button.set_margin_bottom(8);
+
+    let motion_path_owned = motion_path.to_string();
+    let inline_playback: Rc<RefCell<Option<InlineVideoPlayback>>> = Rc::new(RefCell::new(None));
+    let inline_playback_for_cleanup = inline_playback.clone();
+    overlay.connect_unrealize(move |_| {
+        // Removing an attachment can leave the GTK object alive briefly via
+        // signal closures.  Drop the pipeline explicitly rather than letting
+        // that lifetime keep playback running after the thumbnail is gone.
+        inline_playback_for_cleanup.borrow_mut().take();
+    });
+
+    let pic_for_motion = pic.downgrade();
+    let inline_playback_for_click = inline_playback.clone();
+    live_button.connect_clicked(move |_| {
+        let Some(pic) = pic_for_motion.upgrade() else {
+            return;
+        };
+
+        // Keep the motion preview in the existing Picture allocation.  In
+        // particular, do not create a lightbox or change the still's size
+        // request when its paired video starts.
+        crate::video::ensure_gst_init();
+        let Some(playback) = InlineVideoPlayback::new(&motion_path_owned) else {
+            log::warn!("Live Photo play: could not create pipeline for {motion_path_owned}");
+            return;
+        };
+        pic.set_paintable(Some(&playback.paintable));
+        *inline_playback_for_click.borrow_mut() = Some(playback);
+    });
+    overlay.add_overlay(&live_button);
+
+    overlay.upcast()
+}
+
+/// A playbin and its paintable for an inline Live Photo preview.
+///
+/// The pipeline is owned by the thumbnail's widget tree and is stopped as
+/// soon as that tree is unrooted (or when a new playback replaces it).
+struct InlineVideoPlayback {
+    playbin: gstreamer::Element,
+    paintable: gtk::gdk::Paintable,
+}
+
+impl InlineVideoPlayback {
+    fn new(path: &str) -> Option<Self> {
+        use gstreamer as gst;
+        use gst::prelude::ElementExt;
+
+        let playbin = gst::ElementFactory::make("playbin")
+            .name("inline-playbin")
+            .build()
+            .ok()?;
+        let uri = format!("file://{path}");
+        playbin.set_property("uri", &uri);
+
+        let video_sink = gst::ElementFactory::make("gtk4paintablesink")
+            .name("inline-video-sink")
+            .build()
+            .ok()?;
+        playbin.set_property("video-sink", &video_sink);
+        let paintable: gtk::gdk::Paintable = video_sink.property("paintable");
+
+        playbin.set_state(gst::State::Playing).ok()?;
+        Some(Self { playbin, paintable })
+    }
+}
+
+impl Drop for InlineVideoPlayback {
+    fn drop(&mut self) {
+        use gstreamer::prelude::ElementExt;
+        let _ = self.playbin.set_state(gstreamer::State::Null);
+    }
 }
 
 /// A video thumbnail widget that decodes a single frame on a background thread
@@ -388,8 +493,9 @@ fn find_lightbox_host(w: &gtk::Widget) -> Option<gtk::Overlay> {
 }
 
 /// Layer a dimmed, centered, full-size image over the UI. Click anywhere or
-/// press Escape to dismiss.
-fn show_lightbox(host: &gtk::Overlay, path: &str) {
+/// press Escape to dismiss. A paired motion file gets a corner play affordance
+/// which opens the video lightbox without changing dismissal behavior.
+fn show_lightbox(host: &gtk::Overlay, path: &str, motion_path: Option<&str>) {
     log::debug!("show_lightbox: opening {path}");
     let Some(texture) = load_texture(path) else {
         log::warn!("show_lightbox: load_texture returned None for {path}");
@@ -411,7 +517,26 @@ fn show_lightbox(host: &gtk::Overlay, path: &str) {
     pic.set_margin_bottom(32);
     pic.set_margin_start(32);
     pic.set_margin_end(32);
-    dim.append(&pic);
+    let content = gtk::Overlay::new();
+    content.set_hexpand(true);
+    content.set_vexpand(true);
+    content.set_child(Some(&pic));
+
+    let live_button = if let Some(motion_path) = motion_path {
+        let live_button = gtk::Button::from_icon_name("media-playback-start-symbolic");
+        live_button.add_css_class("live-photo-button");
+        live_button.set_tooltip_text(Some("Play Live Photo"));
+        live_button.set_halign(gtk::Align::End);
+        live_button.set_valign(gtk::Align::End);
+        live_button.set_margin_end(16);
+        live_button.set_margin_bottom(16);
+
+        content.add_overlay(&live_button);
+        Some((live_button, motion_path.to_string()))
+    } else {
+        None
+    };
+    dim.append(&content);
 
     // Toplevel window for reliable key event capture.
     let toplevel = host.root().and_then(|r| r.downcast::<gtk::Window>().ok());
@@ -435,8 +560,24 @@ fn show_lightbox(host: &gtk::Overlay, path: &str) {
             glib::Propagation::Proceed
         }
     });
+    let keys_for_motion = keys.clone();
     if let Some(ref win) = toplevel {
         win.add_controller(keys);
+    }
+
+    // Move from the still preview to the video viewer rather than stacking two
+    // lightboxes. This keeps Escape and outside-click dismissal unambiguous.
+    if let Some((live_button, motion_path)) = live_button {
+        let host_for_motion = host.clone();
+        let dim_for_motion = dim.clone();
+        let tl_motion = toplevel.clone();
+        live_button.connect_clicked(move |_| {
+            if let Some(ref win) = tl_motion {
+                win.remove_controller(&keys_for_motion);
+            }
+            host_for_motion.remove_overlay(&dim_for_motion);
+            show_video_lightbox(&host_for_motion, &motion_path);
+        });
     }
 
     // Click on the dim layer dismisses (also removes the key controller).

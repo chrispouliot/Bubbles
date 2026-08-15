@@ -2199,6 +2199,18 @@ fn ext_for(mime: &str, name: &str) -> String {
     .to_string()
 }
 
+/// Apple names the still and motion members of a Live Photo with the same
+/// basename (for example, `IMG_1234.HEIC` and `IMG_1234.MOV`). Keep that
+/// basename as the store-level pairing key; the decoded `iris` flag guards
+/// against pairing ordinary files that happen to share a name.
+fn live_photo_pairing_id(name: &str) -> Option<String> {
+    std::path::Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_lowercase)
+}
+
 fn mime_to_uti(mime: &str) -> String {
     match mime {
         "image/jpeg" => "public.jpeg",
@@ -2267,6 +2279,8 @@ async fn download_inbound(
                     local_path: Some(path.to_string_lossy().into_owned()),
                     part_index: Some(part_index),
                     is_sticker: false,
+                    is_live_photo: att.iris,
+                    pairing_id: live_photo_pairing_id(&att.name),
                 });
             }
             Err(crate::attachment_cache::DownloadError::Download(e)) => {

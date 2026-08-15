@@ -183,6 +183,15 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         )?;
         v = 8;
     }
+    if v < 9 {
+        // Preserve decoded Live Photo membership and the key shared by its
+        // still and motion attachments.
+        c.execute_batch(
+            "ALTER TABLE attachment ADD COLUMN is_live_photo INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE attachment ADD COLUMN pairing_id TEXT;",
+        )?;
+        v = 9;
+    }
     c.pragma_update(None, "user_version", v)?;
     Ok(())
 }
@@ -332,12 +341,14 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
             let (width, height) = attachment_dimensions(a);
             c.execute(
                 "INSERT INTO attachment
-                    (message_id, guid, mime_type, transfer_name, total_bytes,
-                     local_path, width, height, part_index, is_sticker)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     (message_id, guid, mime_type, transfer_name, total_bytes,
+                      local_path, width, height, part_index, is_sticker,
+                      is_live_photo, pairing_id)
+                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     msg_id, a.guid, a.mime, a.name, a.total_bytes,
-                    a.local_path, width, height, a.part_index, a.is_sticker as i64
+                    a.local_path, width, height, a.part_index, a.is_sticker as i64,
+                    a.is_live_photo as i64, a.pairing_id
                 ],
             )?;
         }
@@ -635,7 +646,7 @@ fn load_attachments(
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT a.id, a.message_id, a.mime_type, a.transfer_name, a.local_path, a.is_sticker,
-                a.width, a.height
+                 a.is_live_photo, a.pairing_id, a.width, a.height
          FROM attachment a WHERE a.message_id IN ({placeholders})
          ORDER BY a.part_index ASC, a.id ASC"
     );
@@ -649,8 +660,10 @@ fn load_attachments(
                 name: r.get(3)?,
                 local_path: r.get(4)?,
                 is_sticker: r.get::<_, i64>(5)? != 0,
-                width: r.get(6)?,
-                height: r.get(7)?,
+                is_live_photo: r.get::<_, i64>(6)? != 0,
+                pairing_id: r.get(7)?,
+                width: r.get(8)?,
+                height: r.get(9)?,
             },
         ))
     })?;
@@ -1576,6 +1589,8 @@ mod tests {
             local_path: Some("/tmp/cat.jpg".into()),
             part_index: Some(0),
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         }];
         apply_blocking(&mut c, Ingest::Message(m)).unwrap();
         let chats = query_chats(&c).unwrap();
@@ -1583,6 +1598,54 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].attachments.len(), 1);
         assert_eq!(page[0].attachments[0].name.as_deref(), Some("cat.jpg"));
+    }
+
+    #[tokio::test]
+    async fn live_photo_attachments_round_trip_and_group_as_one_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("bubbles.db")).await.unwrap();
+        let pair_id = "img_1234";
+        let mut message = msg("LIVE-PHOTO-1", 600);
+        message.text = None;
+        message.attachments = vec![
+            AttachmentRecord {
+                guid: Some("live-still".into()),
+                mime: Some("image/heic".into()),
+                name: Some("IMG_1234.HEIC".into()),
+                local_path: Some(dir.path().join("IMG_1234.HEIC").to_string_lossy().into()),
+                part_index: Some(0),
+                is_live_photo: true,
+                pairing_id: Some(pair_id.into()),
+                ..Default::default()
+            },
+            AttachmentRecord {
+                guid: Some("live-motion".into()),
+                mime: Some("video/quicktime".into()),
+                name: Some("IMG_1234.MOV".into()),
+                local_path: Some(dir.path().join("IMG_1234.MOV").to_string_lossy().into()),
+                part_index: Some(1),
+                is_live_photo: false,
+                pairing_id: None,
+                ..Default::default()
+            },
+        ];
+        store.apply(Ingest::Message(message)).await.unwrap();
+
+        let chat_id = store.chats().await.unwrap()[0].id;
+        let page = store.messages_page(chat_id, None, 10).await.unwrap();
+        let assets = &page[0].attachments;
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets.iter().filter(|asset| asset.is_live_photo).count(), 1);
+        assert_eq!(assets[0].pairing_id.as_deref(), Some(pair_id));
+        assert_eq!(assets[1].pairing_id, None);
+
+        let grouped = group_attachments(assets);
+        assert_eq!(grouped.len(), 1, "a Live Photo is one logical media item");
+        let AttachmentGroup::LivePhoto { still, motion } = &grouped[0] else {
+            panic!("expected the paired HEIC and MOV assets to form a Live Photo");
+        };
+        assert_eq!(still.mime.as_deref(), Some("image/heic"));
+        assert_eq!(motion.mime.as_deref(), Some("video/quicktime"));
     }
 
     // --- link preview tests ---
@@ -2252,12 +2315,12 @@ mod tests {
         );
 
         // Assert user_version bumped through all migrations applied from a v4
-        // base (v5, v6, v7, v8, …). Update this expected value whenever a new
+        // base (v5, v6, v7, v8, v9, …). Update this expected value whenever a new
         // migration arm is added to `migrate()`.
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 8, "user_version must be 8 after migration from a v4 base");
+        assert_eq!(v, 9, "user_version must be 9 after migration from a v4 base");
     }
 
     #[test]
@@ -2853,12 +2916,12 @@ mod tests {
     }
 
     #[test]
-    fn migration_bumps_user_version_to_8() {
+    fn migration_bumps_user_version_to_9() {
         let c = db();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 8, "migration must bump user_version to 8");
+        assert_eq!(v, 9, "migration must bump user_version to 9");
 
         let width_col: i64 = c
             .query_row(
@@ -2928,6 +2991,8 @@ mod tests {
             local_path: Some("/tmp/a.jpg".into()),
             part_index: Some(0),
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         }];
         apply_blocking(&mut c, Ingest::Message(m_a)).unwrap();
 

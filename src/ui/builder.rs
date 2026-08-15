@@ -6,6 +6,7 @@
 use super::*;
 use super::media::{image_widget, video_widget, texture_from_bytes};
 use super::link_preview::link_preview_card;
+use crate::store::{group_attachments, AttachmentGroup};
 
 // ---------------------------------------------------------------
 // ChipEntry — stored in the chip map
@@ -873,20 +874,40 @@ fn message_body(
         })
         .build();
 
-    for att in &m.attachments {
-        match att.kind() {
-            AttachmentKind::Image => {
-                if let Some(path) = att.local_path.as_deref() {
-                    col.append(&image_widget(path, att.width.zip(att.height)));
+    for group in group_attachments(&m.attachments) {
+        match group {
+            AttachmentGroup::Single(att) => match att.kind() {
+                AttachmentKind::Image => {
+                    if let Some(path) = att.local_path.as_deref() {
+                        col.append(&image_widget(path, att.width.zip(att.height)));
+                    }
                 }
-            }
-            AttachmentKind::Video => {
-                if let Some(path) = att.local_path.as_deref() {
-                    col.append(&video_widget(path, att.width.zip(att.height)));
+                AttachmentKind::Video => {
+                    if let Some(path) = att.local_path.as_deref() {
+                        col.append(&video_widget(path, att.width.zip(att.height)));
+                    }
                 }
-            }
-            AttachmentKind::Other => {
-                col.append(&file_chip(att, own));
+                AttachmentKind::Other => {
+                    col.append(&file_chip(&att, own));
+                }
+            },
+            AttachmentGroup::LivePhoto { still, motion } => {
+                if let Some(still_path) = still.local_path.as_deref() {
+                    let dimensions = still.width.zip(still.height);
+                    if let Some(motion_path) = motion.local_path.as_deref() {
+                        col.append(&live_photo_widget(still_path, motion_path, dimensions));
+                    } else {
+                        col.append(&image_widget(still_path, dimensions));
+                    }
+                } else if let Some(motion_path) = motion.local_path.as_deref() {
+                    // Keep a partially cached pair visible if its still has not
+                    // arrived yet; a complete pair takes the still-image path
+                    // above and never renders two separate media items.
+                    col.append(&video_widget(
+                        motion_path,
+                        motion.width.zip(motion.height),
+                    ));
+                }
             }
         }
     }

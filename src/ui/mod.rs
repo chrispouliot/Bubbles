@@ -138,6 +138,17 @@ const CSS: &str = "
   border-radius: 14px;
   background-color: #00000010;
 }
+.live-photo-button {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 4px;
+  border-radius: 999px;
+  background-color: alpha(#000000, 0.72);
+  color: #ffffff;
+}
+.live-photo-button:hover {
+  background-color: alpha(#000000, 0.86);
+}
 .lightbox-dim {
   background-color: rgba(0, 0, 0, 0.8);
 }
@@ -2151,7 +2162,6 @@ fn _update_crop_indicator_math_doc(
     let y = (display_cy - display_r).round() as i32;
     let _ = (dia, x, y);
 }
-
 
 
 

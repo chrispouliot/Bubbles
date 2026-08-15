@@ -403,6 +403,8 @@ mod extract_target_text_tests {
             width: None,
             height: None,
             is_sticker: false,
+            is_live_photo: false,
+            pairing_id: None,
         }
     }
 
