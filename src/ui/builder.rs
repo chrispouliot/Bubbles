@@ -1208,6 +1208,7 @@ fn bubble_label(
         .label(&markup)
         .use_markup(true)
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
         .selectable(true)
         .max_width_chars(40)
